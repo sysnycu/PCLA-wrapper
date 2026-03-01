@@ -1,0 +1,17 @@
+run_t:
+    docker build -t pcla-env . 
+    docker run --gpus all --rm \
+    --network host -it \
+    -v .:/workspace -w /workspace  \
+    -v /opt/sbsvf/map/tyms/xodr:/mnt/map/xodr \
+    -v /tmp/.X11-unix:/tmp/.X11-unix -v ~/.Xauthority:/root/.Xauthority \
+    -e DISPLAY  pcla-env
+
+run_f:
+    docker build -t pcla-env . 
+    docker run --gpus all --rm \
+    --network host -it \
+    -v .:/workspace -w /workspace  \
+    -v /opt/sbsvf/map/frankenburg/xodr:/mnt/map/xodr \
+    -v /tmp/.X11-unix:/tmp/.X11-unix -v ~/.Xauthority:/root/.Xauthority \
+    -e DISPLAY  pcla-env

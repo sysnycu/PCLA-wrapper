@@ -1,0 +1,45 @@
+## PCLA wrapper config
+
+pcla:
+  # PCLA agent name. Examples:
+  # - "carl_plant" (uses PlanT agent from CaRL family)
+  # - "tfv5_alltowns"
+  # - "tfv6_regnet"
+  agent: "carl_plant_3"
+  # agent: "neat_neat"
+
+  # Optional: explicit PCLA root path. If omitted, defaults to ./PCLA-wrapper/PCLA
+  # pcla_root: "/workspace/PCLA-wrapper/PCLA"
+
+  # Optional: prebuilt route XML. If omitted, route will be generated from spawn/goal.
+  # route_path: "PCLA/sample_route.xml"
+
+  # Auto-route generation settings
+  # route_waypoint_distance: 2.0
+  # route_draw: false
+  # route_cache_dir: "pcla_routes"
+
+carla:
+  host: "localhost"
+  port: 2000
+  timeout: 10.0
+
+  # Optional CARLA python API settings
+  # carla_root: "/opt/carla-0.9.16"
+  # carla_egg: "/opt/carla-0.9.16/PythonAPI/carla/dist/carla-0.9.16-py3.8-linux-x86_64.egg"
+
+  # World settings
+  sync: true
+  no_rendering: false
+  fixed_delta_seconds: 0.05
+
+  # Ego vehicle settings
+  ego_role_name: "hero"
+  ego_bp_id: "vehicle.tesla.model3"
+  spawn_z_offset: 1.0
+  # Yaw unit from upstream observation: "rad" or "deg"
+  yaw_unit: "rad"
+
+  # Map settings
+  # xodr_root: "/mnt/map/xodr"
+  # carla_map_name: "Town02"
