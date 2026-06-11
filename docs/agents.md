@@ -64,7 +64,9 @@ the wrong directory can hide files included in the image.
 
 Sensor requirements differ by agent:
 
-- Camera-based agents may require `no_rendering: false`.
+- Camera-based agents require rendering. The wrapper automatically disables
+  `no_rendering_mode` after detecting a camera sensor.
+- The owned server must not use NullRHI for camera agents.
 - Agents using OpenDRIVE pseudo-sensors require a valid generated CARLA map.
 - Sensor spawn failure is a reset precondition failure and partial sensors are
   cleaned automatically.

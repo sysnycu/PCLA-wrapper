@@ -267,6 +267,8 @@ def configured_adapter(world=None):
     adapter._traffic_manager_port = 8000
     adapter._manage_traffic_manager_sync = False
     adapter._action_none_timeout = 0.0
+    adapter._sensor_warmup_ticks = 0
+    adapter._pcla_runtime_dir = None
     adapter._vehicle = FakeActor(1)
     adapter._spawned_actor_ids = {1}
     return adapter
@@ -285,6 +287,49 @@ def test_server_uses_generic_pisa_service():
     assert 'serve_av_system(PclaAV(), name="PCLA")' in source
     assert "grpc.server" not in source
     assert "sbsvf_api" not in source
+
+
+def test_owned_carla_launcher_preserves_rendering_and_drops_root():
+    source = Path("carla_server.sh").read_text(encoding="utf-8")
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    assert "-RenderOffScreen" in source
+    assert 'CARLA_NULLRHI:-0' in source
+    assert 'else\n    args+=("-quality-level=' in source
+    assert 'cd "${CARLA_ROOT}"' in source
+    assert "carla-rpc-timeout" in source
+    assert "carla-tm-port" in source
+    assert 'CARLA_RUN_UID:-$(id -u carla)' in source
+    assert 'CARLA_RUN_GID:-$(id -g carla)' in source
+    assert "setpriv" in source
+    assert "/root/.Xauthority" in source
+    assert "XDG_RUNTIME_DIR" in source
+    assert "FROM ubuntu:24.04" in dockerfile
+    assert "usermod --login carla" in dockerfile
+    assert "NVIDIA_DRIVER_CAPABILITIES=all" in dockerfile
+    assert "docker/nvidia_icd.json" in dockerfile
+    assert "libegl1" in dockerfile
+    assert "xdg-user-dirs" in dockerfile
+    assert Path("docker/nvidia_icd.json").is_file()
+
+
+def test_plant_route_planner_uses_world_coordinates():
+    source = Path(
+        "PCLA-wrapper/PCLA/pcla_agents/plant/PlanT_agent.py"
+    ).read_text(encoding="utf-8")
+    assert "set_route(self._global_plan_world_coord, False)" in source
+    assert "set_route(self._global_plan, True)" not in source
+    assert "downsample_route(global_plan_world_coord, 50)" in source
+    assert "downsample_route(global_plan_world_coord, 200)" not in source
+    assert "PlanT state step=%d" in source
+
+
+def test_plant_privileged_route_index_tracks_actual_prefix():
+    source = Path(
+        "PCLA-wrapper/PCLA/pcla_agents/plant/carla_garage/"
+        "privileged_route_planner.py"
+    ).read_text(encoding="utf-8")
+    assert "self.route_index = 0" in source
+    assert "self.route_index += self.points_per_meter" in source
 
 
 def test_constructor_is_lazy():
@@ -331,6 +376,14 @@ def test_config_validation_for_agent_identity_sign_and_timeout(tmp_path):
     with pytest.raises(InvalidAvRequest, match="retry_interval_seconds"):
         adapter._parse_config()
 
+    adapter.config = {"pcla_root": str(root), "sensor_warmup_ticks": -1}
+    with pytest.raises(InvalidAvRequest, match="sensor_warmup_ticks"):
+        adapter._parse_config()
+
+    adapter.config = {"pcla_root": str(root), "sensor_warmup_ticks": 1.5}
+    with pytest.raises(InvalidAvRequest, match="integer"):
+        adapter._parse_config()
+
     adapter.config = {"pcla_root": str(root), "pcla_agent": "missing_agent"}
     adapter._parse_config()
     with pytest.raises(InvalidAvRequest, match="Accepted formats"):
@@ -359,6 +412,37 @@ def test_init_parses_request_without_loading_models(tmp_path):
     assert adapter._pcla_module is None
 
 
+def test_string_false_disables_owned_carla_launch(tmp_path):
+    root = tmp_path / "PCLA"
+    write_agents(root)
+    adapter = PclaAV()
+    adapter.config = {
+        "pcla_root": str(root),
+        "launch_carla_server": "false",
+        "sync": "true",
+        "no_rendering": "false",
+    }
+
+    adapter._parse_config()
+
+    assert adapter._launch_carla_server is False
+    assert adapter._sync is True
+    assert adapter._no_rendering is False
+
+
+def test_invalid_boolean_config_is_rejected(tmp_path):
+    root = tmp_path / "PCLA"
+    write_agents(root)
+    adapter = PclaAV()
+    adapter.config = {
+        "pcla_root": str(root),
+        "launch_carla_server": "external",
+    }
+
+    with pytest.raises(InvalidAvRequest, match="launch_carla_server must be a boolean"):
+        adapter._parse_config()
+
+
 def test_environment_overrides_agent_route_and_carla(monkeypatch, tmp_path):
     route = tmp_path / "route.xml"
     monkeypatch.setenv("PCLA_AGENT", "carl_plant_9")
@@ -379,6 +463,88 @@ def test_environment_overrides_agent_route_and_carla(monkeypatch, tmp_path):
     assert adapter._host == "external"
     assert adapter._port == 2100
     assert adapter._carla_timeout == 33.0
+
+
+def test_reset_output_dir_is_relative_to_init_output_base(tmp_path):
+    adapter = PclaAV()
+    adapter._output_base = tmp_path / "output"
+
+    resolved = adapter._resolve_reset_output_dir(Path("concrete"))
+
+    assert resolved == (tmp_path / "output" / "concrete").resolve()
+    assert resolved.is_dir()
+
+
+def test_absolute_reset_output_dir_is_preserved(tmp_path):
+    adapter = PclaAV()
+    adapter._output_base = tmp_path / "base"
+    absolute = tmp_path / "absolute-case"
+
+    resolved = adapter._resolve_reset_output_dir(absolute)
+
+    assert resolved == absolute
+    assert resolved.is_dir()
+
+
+def test_reset_output_dir_cannot_escape_init_output_base(tmp_path):
+    adapter = PclaAV()
+    adapter._output_base = tmp_path / "output"
+
+    with pytest.raises(InvalidAvRequest, match="escapes Init output base"):
+        adapter._resolve_reset_output_dir(Path("../outside"))
+
+
+def test_pcla_runtime_dir_defaults_to_reset_output_and_blocks_escape(tmp_path):
+    adapter = PclaAV()
+    adapter._output_dir = tmp_path / "case"
+    adapter.config = {}
+
+    resolved = adapter._resolve_pcla_runtime_dir()
+
+    assert resolved == (tmp_path / "case" / "pcla_runtime").resolve()
+    assert resolved.is_dir()
+
+    adapter.config = {"pcla_runtime_dir": "../outside"}
+    with pytest.raises(InvalidAvRequest, match="escapes Reset output"):
+        adapter._resolve_pcla_runtime_dir()
+
+
+def test_absolute_pcla_runtime_dir_is_preserved(tmp_path):
+    adapter = PclaAV()
+    adapter._output_dir = tmp_path / "case"
+    runtime_dir = tmp_path / "shared-runtime"
+    adapter.config = {"pcla_runtime_dir": str(runtime_dir)}
+
+    assert adapter._resolve_pcla_runtime_dir() == runtime_dir.resolve()
+    assert runtime_dir.is_dir()
+
+
+def test_owned_carla_gets_writable_home_and_cache(monkeypatch, tmp_path):
+    adapter = PclaAV()
+    adapter._output_dir = tmp_path / "output"
+    adapter._carla_home = tmp_path / "carla-home"
+    adapter.config = {"carla_server_script": "/fake/carla_server.sh"}
+    captured = {}
+
+    class Process:
+        pid = 123
+
+    def popen(args, **kwargs):
+        captured["args"] = args
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setattr("pcla_wrapper.pcla_av.subprocess.Popen", popen)
+
+    adapter._launch_server()
+
+    assert captured["args"] == ["/fake/carla_server.sh"]
+    assert captured["env"]["HOME"] == str(adapter._carla_home)
+    assert captured["env"]["CARLA_HOME"] == str(adapter._carla_home)
+    assert captured["env"]["XDG_CACHE_HOME"] == str(adapter._carla_home / ".cache")
+    assert captured["start_new_session"] is True
+    assert (adapter._carla_home / "carlaCache").is_dir()
+    assert (adapter._carla_home / ".cache").is_dir()
 
 
 def test_connection_restores_timeout_on_success_and_failure(monkeypatch):
@@ -477,21 +643,26 @@ def test_route_path_validation_and_output_isolation(tmp_path):
     adapter = configured_adapter()
     adapter._pcla_root = tmp_path
     adapter._route_path_cfg = "missing.xml"
+    scenario = SimpleNamespace(
+        name="x",
+        ego=SimpleNamespace(goal_config=SimpleNamespace(position=kinematic(x=10))),
+    )
     with pytest.raises(InvalidAvRequest, match="not readable"):
-        adapter._resolve_route_path(SimpleNamespace(name="x"), [object_state()])
+        adapter._resolve_route_path(scenario, [object_state()])
 
     route = tmp_path / "route.xml"
     route.write_text("<route/>", encoding="utf-8")
     adapter._route_path_cfg = str(route)
-    assert adapter._resolve_route_path(SimpleNamespace(name="x"), [object_state()]) == route
+    assert adapter._resolve_route_path(scenario, [object_state()]) == route
 
 
-def test_generated_route_is_atomic_sanitized_and_requires_waypoints(tmp_path):
+def test_generated_route_logs_raw_converted_and_projected_endpoints(tmp_path, caplog):
     adapter = configured_adapter()
     adapter._route_path_cfg = None
     adapter._output_dir = tmp_path / "case-a"
     adapter._route_wp_distance = 2.0
     adapter._route_draw = False
+    adapter._coordinate_y_sign = -1.0
     adapter._pcla_module = SimpleNamespace(
         location_to_waypoint=lambda *args, **kwargs: [
             SimpleNamespace(transform=FakeTransform(FakeLocation(0, 0, 0))),
@@ -504,34 +675,65 @@ def test_generated_route_is_atomic_sanitized_and_requires_waypoints(tmp_path):
     scenario = SimpleNamespace(
         name="../../unsafe",
         ego=SimpleNamespace(
-            goal_config=SimpleNamespace(position=kinematic(x=10)),
+            goal_config=SimpleNamespace(position=kinematic(x=10, y=6, z=1)),
         ),
     )
-    route = adapter._resolve_route_path(scenario, [object_state()])
+    with caplog.at_level("INFO", logger="pcla_wrapper.pcla_av"):
+        route = adapter._resolve_route_path(
+            scenario,
+            [SimpleNamespace(kinematic=kinematic(x=2, y=4, z=1))],
+        )
     assert route.parent == tmp_path / "case-a" / "pcla_routes"
     assert ".." not in route.name
     assert route.read_text(encoding="utf-8") == "<route/>"
+    assert "PISA start=(2.000, 4.000, 1.000) goal=(10.000, 6.000, 1.000)" in caplog.text
+    assert "CARLA start=(2.000, -4.000, 1.000) goal=(10.000, -6.000, 1.000)" in caplog.text
+    assert "Projected route endpoints" in caplog.text
 
     adapter._pcla_module.location_to_waypoint = lambda *args, **kwargs: []
     with pytest.raises(AvPreconditionFailed, match="fewer than two"):
         adapter._resolve_route_path(scenario, [object_state()])
 
 
-def test_pcla_constructor_receives_agent_vehicle_route_client():
+def test_pcla_constructor_uses_writable_runtime_and_restores_cwd(tmp_path):
     adapter = configured_adapter()
     calls = []
+    original_cwd = Path.cwd()
+    adapter._pcla_runtime_dir = tmp_path / "runtime"
+    adapter._pcla_runtime_dir.mkdir()
 
     class FakePcla:
         def __init__(self, *args, **kwargs):
-            calls.append((args, kwargs))
+            Path("plant_viz/run").mkdir(parents=True)
+            calls.append((args, kwargs, Path.cwd()))
 
     adapter._pcla_module = SimpleNamespace(PCLA=FakePcla)
     adapter._agent_name = "carl_plant_3"
     route = Path("/tmp/route.xml")
     adapter._build_pcla(route)
-    args, kwargs = calls[0]
+    args, kwargs, constructor_cwd = calls[0]
     assert args == ("carl_plant_3", adapter._vehicle, str(route), adapter._client)
     assert kwargs == {"destroy_vehicle": False}
+    assert constructor_cwd == adapter._pcla_runtime_dir
+    assert (adapter._pcla_runtime_dir / "plant_viz" / "run").is_dir()
+    assert Path.cwd() == original_cwd
+
+
+def test_pcla_runtime_cwd_restores_after_failure(tmp_path):
+    adapter = configured_adapter()
+    original_cwd = Path.cwd()
+    adapter._pcla_runtime_dir = tmp_path / "runtime"
+    adapter._pcla_runtime_dir.mkdir()
+    adapter._agent_name = "carl_plant_3"
+
+    def fail(*args, **kwargs):
+        assert Path.cwd() == adapter._pcla_runtime_dir
+        raise RuntimeError("setup failed")
+
+    adapter._pcla_module = SimpleNamespace(PCLA=fail)
+    with pytest.raises(RuntimeError, match="setup failed"):
+        adapter._build_pcla(Path("route.xml"))
+    assert Path.cwd() == original_cwd
 
 
 def test_pcla_constructor_maps_timeout_and_missing_weights():
@@ -547,6 +749,60 @@ def test_pcla_constructor_maps_timeout_and_missing_weights():
     )
     with pytest.raises(AvUnavailable, match="checkpoint.pt"):
         adapter._build_pcla(Path("route.xml"))
+
+
+def test_camera_sensor_enables_rendering_and_warms_up():
+    adapter = configured_adapter()
+    adapter._world.settings.no_rendering_mode = True
+    adapter._sensor_warmup_ticks = 2
+    adapter._pcla = SimpleNamespace(
+        _sensors=[
+            SimpleNamespace(type_id="sensor.camera.rgb"),
+            SimpleNamespace(type_id="sensor.other.imu"),
+        ]
+    )
+
+    adapter._prepare_pcla_sensors()
+
+    assert adapter._world.settings.no_rendering_mode is False
+    assert adapter._world.tick_calls == 2
+
+
+def test_driving_state_log_includes_heading_and_converted_steer(caplog):
+    adapter = configured_adapter()
+    adapter._debug_log_interval_steps = 20
+    adapter._step_count = 1
+    adapter._last_timestamp_ns = 123
+    adapter._steer_sign = -1.0
+    adapter._route_start_location = FakeLocation(0, 0, 0)
+    adapter._route_goal_location = FakeLocation(100, 0, 0)
+    adapter._vehicle.transform = FakeTransform(
+        FakeLocation(5, 0, 0), FakeRotation(yaw=10)
+    )
+    adapter._vehicle.velocity = FakeVector(3, 4, 0)
+    adapter._vehicle.get_transform = lambda: adapter._vehicle.transform
+    adapter._vehicle.get_velocity = lambda: adapter._vehicle.velocity
+    action = SimpleNamespace(throttle=0.5, brake=0.0, steer=0.25)
+
+    with caplog.at_level("INFO", logger="pcla_wrapper.pcla_av"):
+        adapter._log_driving_state(kinematic(x=5, yaw=0.1, speed=5), action)
+
+    assert "heading_error_deg=-10.000" in caplog.text
+    assert "speed=5.000" in caplog.text
+    assert "output_steer=-0.250" in caplog.text
+
+
+def test_sensor_warmup_reports_owned_server_exit():
+    adapter = configured_adapter()
+    adapter._sensor_warmup_ticks = 1
+    adapter._pcla = SimpleNamespace(_sensors=[])
+    adapter._server_owned = True
+    adapter._server_process = FakeProcess(return_code=139)
+    adapter._output_base = Path("/mnt/output")
+
+    with pytest.raises(AvUnavailable, match="return code 139"):
+        adapter._prepare_pcla_sensors()
+    assert "stderr.log" in adapter.should_quit().msg
 
 
 def test_coordinate_yaw_yaw_rate_and_steer_conversion():
@@ -671,6 +927,36 @@ def test_step_ticks_once_before_provider_and_action_with_same_snapshot():
     assert adapter._last_timestamp_ns == 42
 
 
+def test_action_and_cleanup_use_runtime_directory(tmp_path):
+    adapter = configured_adapter()
+    original_cwd = Path.cwd()
+    adapter._pcla_runtime_dir = tmp_path / "runtime"
+    adapter._pcla_runtime_dir.mkdir()
+    calls = []
+
+    class Agent:
+        def get_action(self, snapshot=None):
+            calls.append(("action", Path.cwd()))
+            Path("action-output").mkdir()
+            return SimpleNamespace(throttle=0.1, brake=0.0, steer=0.2)
+
+        def cleanup(self):
+            calls.append(("cleanup", Path.cwd()))
+            Path("cleanup-output").mkdir()
+
+    adapter._pcla = Agent()
+    adapter._get_action(object())
+    adapter._finalize()
+
+    assert calls == [
+        ("action", adapter._pcla_runtime_dir),
+        ("cleanup", adapter._pcla_runtime_dir),
+    ]
+    assert (adapter._pcla_runtime_dir / "action-output").is_dir()
+    assert (adapter._pcla_runtime_dir / "cleanup-output").is_dir()
+    assert Path.cwd() == original_cwd
+
+
 def test_none_action_and_pcla_exception_are_not_silent():
     adapter = configured_adapter()
     adapter._data_provider = None
@@ -725,7 +1011,7 @@ def test_should_quit_reports_owned_process_exit():
     assert "return code 7" in response.msg
 
 
-def test_stop_is_idempotent_and_cleans_process_agent_and_actors():
+def test_stop_is_idempotent_and_keeps_server_while_cleaning_agent_and_actors():
     adapter = configured_adapter()
     process = FakeProcess()
     pcla = SimpleNamespace(cleanup_calls=0)
@@ -742,9 +1028,30 @@ def test_stop_is_idempotent_and_cleans_process_agent_and_actors():
     adapter.stop()
     assert pcla.cleanup_calls == 1
     assert vehicle.destroy_calls == 1
-    assert process.terminate_calls == 1
+    assert process.terminate_calls == 0
+    assert adapter._server_process is process
     assert adapter._client is None
     assert adapter._world is None
+
+
+def test_owned_server_termination_signals_the_process_group(monkeypatch):
+    adapter = PclaAV()
+    process = FakeProcess()
+    process.pid = 123
+    adapter._server_process = process
+    adapter._server_owned = True
+    signals = []
+    monkeypatch.setattr(
+        "pcla_wrapper.pcla_av.os.killpg",
+        lambda process_group, sig: signals.append((process_group, sig)),
+    )
+
+    adapter._terminate_server_process()
+
+    assert signals == [(123, 15)]
+    assert process.wait_calls == 1
+    assert adapter._server_process is None
+    assert adapter._server_owned is False
 
 
 def test_cleanup_helper_preserves_traffic_lights_and_static_props():

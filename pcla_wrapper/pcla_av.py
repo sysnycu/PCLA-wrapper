@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,7 @@ from pisa_api.av import (
 from .lifecycle import clear_dynamic_actors, destroy_actor, force_async_world_for_cleanup
 
 logger = logging.getLogger(__name__)
+PCLA_CWD_LOCK = RLock()
 
 OBJECT_IDENTITY_ATTRS = ("id", "object_id", "track_id", "external_id", "name")
 OBJECT_IDENTITY_MODES = {"index", "provided", "stateless"}
@@ -84,18 +86,30 @@ class PclaAV:
         self._quit_msg = ""
         self._last_error = ""
         self._last_timestamp_ns = 0
+        self._step_count = 0
+        self._route_start_location = None
+        self._route_goal_location = None
         self.config: dict[str, Any] = {}
+        self._output_base = Path()
         self._output_dir = Path()
+        self._pcla_runtime_dir = None
 
     def init(self, request: InitRequest) -> None:
         with self._lock:
             if not self._finalized:
                 self._finalize()
-            self._output_dir = Path(request.output_dir)
+            self._output_base = Path(request.output_dir)
+            self._output_dir = self._output_base
             self.config = self._normalize_config(request.config or {})
             self._fixed_delta_seconds = self._positive_float("dt", request.dt)
             self._parse_config()
             self._validate_agent_name()
+            logger.info(
+                "CARLA mode=%s endpoint=%s:%s",
+                "owned" if self._launch_carla_server else "external",
+                self._host,
+                self._port,
+            )
             if self._launch_carla_server and self._server_process is None:
                 self._launch_server()
             if not self._ensure_connected():
@@ -117,13 +131,16 @@ class PclaAV:
             if not self._finalized:
                 self._finalize()
             self._finalized = False
-            self._output_dir = Path(request.output_dir)
-            scenario = request.scenario_pack
-            observation = request.initial_observation
             self._quit_flag = False
             self._quit_msg = ""
             self._last_error = ""
+            self._step_count = 0
             try:
+                self._pcla_runtime_dir = None
+                self._output_dir = self._resolve_reset_output_dir(request.output_dir)
+                self._pcla_runtime_dir = self._resolve_pcla_runtime_dir()
+                scenario = request.scenario_pack
+                observation = request.initial_observation
                 self._validate_reset_request(scenario, observation)
                 self._ensure_world(scenario.map_name)
                 self._cleanup_wrapper_actors()
@@ -132,6 +149,7 @@ class PclaAV:
                 self._set_data_provider()
                 route_path = self._resolve_route_path(scenario, observation)
                 self._pcla = self._build_pcla(route_path)
+                self._prepare_pcla_sensors()
                 return ResetResponse(
                     ctrl_cmd=self.step(
                         StepRequest(observation=observation, timestamp_ns=0)
@@ -148,6 +166,7 @@ class PclaAV:
                 raise InvalidAvRequest("Step observation must include ego state")
             if self._pcla is None or self._vehicle is None:
                 raise AvPreconditionFailed("PCLA scenario is not ready; call reset first")
+            self._raise_if_owned_server_exited()
             self._last_timestamp_ns = int(request.timestamp_ns)
             try:
                 snapshot = self._update_and_tick(request.observation)
@@ -157,6 +176,7 @@ class PclaAV:
             except AvError:
                 raise
             except Exception as exc:
+                self._raise_if_owned_server_exited()
                 self._set_fatal_error(f"PCLA step failed: {exc}")
                 logger.exception("PCLA step failed")
                 raise AvUnavailable(str(exc)) from exc
@@ -171,6 +191,11 @@ class PclaAV:
             if hasattr(self._pcla, "done") and self._pcla.done():
                 self._quit_flag = True
                 self._quit_msg = "PCLA agent reached the route endpoint."
+            self._step_count += 1
+            self._log_driving_state(request.observation[0].kinematic, action)
+            print(
+                f"throttle={action.throttle:.3f} brake={action.brake:.3f} steer={action.steer:.3f}"
+            )
             return StepResponse(
                 ctrl_cmd=ControlCommand(
                     mode=ControlMode.THROTTLE_STEER_BREAK,
@@ -185,7 +210,6 @@ class PclaAV:
     def stop(self) -> None:
         with self._lock:
             self._finalize()
-            self._terminate_server_process()
             self._client = None
             self._server_version = None
             self._world = None
@@ -203,9 +227,7 @@ class PclaAV:
         if self._server_owned and process is not None:
             return_code = process.poll()
             if return_code is not None:
-                self._set_fatal_error(
-                    f"Owned CARLA server exited unexpectedly with return code {return_code}."
-                )
+                self._set_fatal_error(self._owned_server_exit_message(return_code))
         return ShouldQuitResponse(should_quit=self._quit_flag, msg=self._quit_msg)
 
     def _normalize_config(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -237,6 +259,76 @@ class PclaAV:
                 config[key] = value
         return config
 
+    def _resolve_reset_output_dir(self, requested: Any) -> Path:
+        requested_path = Path(requested)
+        if requested_path.is_absolute():
+            output_dir = requested_path
+        else:
+            base = self._output_base.resolve()
+            output_dir = (base / requested_path).resolve()
+            try:
+                output_dir.relative_to(base)
+            except ValueError as exc:
+                raise InvalidAvRequest(
+                    f"Reset output_dir escapes Init output base: {requested_path}"
+                ) from exc
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise InvalidAvRequest(
+                f"Failed to create reset output directory: {output_dir}"
+            ) from exc
+        return output_dir
+
+    def _resolve_pcla_runtime_dir(self) -> Path:
+        configured = self.config.get("pcla_runtime_dir")
+        if configured in (None, ""):
+            runtime_dir = self._output_dir / "pcla_runtime"
+        else:
+            try:
+                configured_path = Path(configured)
+            except TypeError as exc:
+                raise InvalidAvRequest(
+                    f"pcla_runtime_dir must be a path, got {configured!r}"
+                ) from exc
+            if configured_path.is_absolute():
+                runtime_dir = configured_path
+            else:
+                output_dir = self._output_dir.resolve()
+                runtime_dir = (output_dir / configured_path).resolve()
+                try:
+                    runtime_dir.relative_to(output_dir)
+                except ValueError as exc:
+                    raise InvalidAvRequest(
+                        f"pcla_runtime_dir escapes Reset output directory: {configured_path}"
+                    ) from exc
+        try:
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise InvalidAvRequest(
+                f"Failed to create PCLA runtime directory: {runtime_dir}"
+            ) from exc
+        return runtime_dir.resolve()
+
+    @contextlib.contextmanager
+    def _in_pcla_runtime_dir(self):
+        runtime_dir = self._pcla_runtime_dir
+        if runtime_dir is None:
+            yield
+            return
+        with PCLA_CWD_LOCK:
+            previous_dir = Path.cwd()
+            try:
+                os.chdir(runtime_dir)
+            except OSError as exc:
+                raise AvUnavailable(
+                    f"Failed to enter PCLA runtime directory: {runtime_dir}"
+                ) from exc
+            try:
+                yield
+            finally:
+                os.chdir(previous_dir)
+
     def _parse_config(self) -> None:
         default_root = Path(__file__).resolve().parents[1] / "PCLA-wrapper" / "PCLA"
         self._pcla_root = Path(self.config.get("pcla_root", default_root)).resolve()
@@ -246,8 +338,8 @@ class PclaAV:
         route_override = os.environ.get("PCLA_ROUTE")
         self._route_path_cfg = route_override or self.config.get("route_xml_path")
         self._route_wp_distance = self._config_float("route_waypoint_distance", 2.0)
-        self._route_draw = bool(self.config.get("route_draw", False))
-        self._launch_carla_server = bool(self.config.get("launch_carla_server", True))
+        self._route_draw = self._config_bool("route_draw", False)
+        self._launch_carla_server = self._config_bool("launch_carla_server", True)
         self._connect_timeout = self._config_float(
             "carla_connect_timeout_seconds",
             self._config_float("max_retry_times", 15.0) * 2.0,
@@ -266,13 +358,17 @@ class PclaAV:
         self._carla_timeout = self._env_float(
             "CARLA_TIMEOUT", self._config_float("carla_timeout", 10.0)
         )
-        self._sync = bool(self.config.get("sync", True))
-        self._no_rendering = bool(self.config.get("no_rendering", True))
+        self._carla_home = Path(
+            os.environ.get(
+                "CARLA_HOME",
+                self.config.get("carla_home", self._output_dir / "carla_home"),
+            )
+        ).resolve()
+        self._sync = self._config_bool("sync", True)
+        self._no_rendering = self._config_bool("no_rendering", True)
         self._xodr_root = Path(self.config.get("xodr_root", "/mnt/map/xodr"))
-        self._reuse_generated_world = bool(self.config.get("reuse_generated_world", True))
-        self._manage_traffic_manager_sync = bool(
-            self.config.get("manage_traffic_manager_sync", False)
-        )
+        self._reuse_generated_world = self._config_bool("reuse_generated_world", True)
+        self._manage_traffic_manager_sync = self._config_bool("manage_traffic_manager_sync", False)
         self._ego_role_name = str(self.config.get("ego_role_name", "hero"))
         self._ego_bp_id = str(self.config.get("ego_bp_id", "vehicle.tesla.model3"))
         self._spawn_z_offset = self._config_float("spawn_z_offset", 3.0)
@@ -291,6 +387,12 @@ class PclaAV:
         self._action_none_timeout = self._config_float("action_none_timeout_seconds", 0.0)
         if self._action_none_timeout < 0:
             raise InvalidAvRequest("action_none_timeout_seconds must be non-negative")
+        self._sensor_warmup_ticks = self._config_int("sensor_warmup_ticks", 1)
+        if self._sensor_warmup_ticks < 0:
+            raise InvalidAvRequest("sensor_warmup_ticks must be non-negative")
+        self._debug_log_interval_steps = self._config_int("debug_log_interval_steps", 20)
+        if self._debug_log_interval_steps < 0:
+            raise InvalidAvRequest("debug_log_interval_steps must be non-negative")
 
     def _config_float(self, name: str, default: float) -> float:
         raw = self.config.get(name, default)
@@ -298,6 +400,30 @@ class PclaAV:
             return float(raw)
         except (TypeError, ValueError) as exc:
             raise InvalidAvRequest(f"{name} must be a float, got {raw!r}") from exc
+
+    def _config_bool(self, name: str, default: bool) -> bool:
+        raw = self.config.get(name, default)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        if isinstance(raw, int) and raw in (0, 1):
+            return bool(raw)
+        raise InvalidAvRequest(f"{name} must be a boolean, got {raw!r}")
+
+    def _config_int(self, name: str, default: int) -> int:
+        raw = self.config.get(name, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAvRequest(f"{name} must be an integer, got {raw!r}") from exc
+        if isinstance(raw, float) and not raw.is_integer():
+            raise InvalidAvRequest(f"{name} must be an integer, got {raw!r}")
+        return value
 
     @staticmethod
     def _positive_float(name: str, raw: Any) -> float:
@@ -390,8 +516,22 @@ class PclaAV:
 
     def _launch_server(self) -> None:
         log_dir = self._output_dir / "carla_server"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = self._carla_home / "carlaCache"
+        xdg_cache_dir = self._carla_home / ".cache"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            xdg_cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise AvUnavailable(
+                f"Failed to create CARLA log/cache directories under "
+                f"{log_dir} and {self._carla_home}"
+            ) from exc
         command = str(self.config.get("carla_server_script", "/app/carla_server.sh"))
+        server_env = os.environ.copy()
+        server_env["HOME"] = str(self._carla_home)
+        server_env["XDG_CACHE_HOME"] = str(xdg_cache_dir)
+        server_env["CARLA_HOME"] = str(self._carla_home)
         try:
             with contextlib.ExitStack() as stack:
                 stdout = stack.enter_context((log_dir / "stdout.log").open("w", encoding="utf-8"))
@@ -400,7 +540,8 @@ class PclaAV:
                     [command],
                     stdout=stdout,
                     stderr=stderr,
-                    env=os.environ.copy(),
+                    env=server_env,
+                    start_new_session=True,
                 )
         except OSError as exc:
             raise AvUnavailable(f"Failed to launch CARLA server with {command}") from exc
@@ -560,6 +701,14 @@ class PclaAV:
     def _to_carla_yaw(self, yaw_rad: float) -> float:
         return self._yaw_sign * math.degrees(float(yaw_rad)) + self._yaw_offset_deg
 
+    @staticmethod
+    def _format_xyz(position: Any) -> str:
+        return (
+            f"({float(position.x):.3f}, "
+            f"{float(position.y):.3f}, "
+            f"{float(position.z):.3f})"
+        )
+
     def _find_blueprint(self, library: Any, candidates: tuple[str, ...]):
         for pattern in candidates:
             try:
@@ -621,12 +770,29 @@ class PclaAV:
         scenario: ScenarioPackData,
         observation: list[ObjectStateData],
     ) -> Path:
+        raw_start = self._get_spawn_position(observation, scenario)
+        raw_goal = self._get_goal_position(scenario)
+        start_xyz = self._extract_xyz(raw_start)
+        goal_xyz = self._extract_xyz(raw_goal)
+        start = self._to_carla_location(raw_start)
+        goal = self._to_carla_location(raw_goal)
+        logger.info(
+            "Reset route endpoints scenario=%r PISA start=(%.3f, %.3f, %.3f) "
+            "goal=(%.3f, %.3f, %.3f) CARLA start=%s goal=%s",
+            scenario.name,
+            *start_xyz,
+            *goal_xyz,
+            self._format_xyz(start),
+            self._format_xyz(goal),
+        )
+
         if self._route_path_cfg:
             path = Path(self._route_path_cfg)
             if not path.is_absolute():
                 path = (self._pcla_root / path).resolve()
             if not path.is_file() or not os.access(path, os.R_OK):
                 raise InvalidAvRequest(f"Configured route XML is not readable: {path}")
+            logger.info("Using configured route XML: %s", path)
             return path
 
         self._ensure_pcla_imports()
@@ -636,12 +802,21 @@ class PclaAV:
         safe_name = safe_name.strip("._") or "scenario"
         route_path = route_dir / f"{safe_name}.route.xml"
 
-        start = self._to_carla_location(self._get_spawn_position(observation, scenario))
-        goal = self._to_carla_location(self._get_goal_position(scenario))
         start_wp = self._map.get_waypoint(start, project_to_road=True)
         goal_wp = self._map.get_waypoint(goal, project_to_road=True)
         if start_wp is None or goal_wp is None:
-            raise AvPreconditionFailed("Failed to project route endpoints onto the CARLA map")
+            raise AvPreconditionFailed(
+                "Failed to project route endpoints onto the CARLA map: "
+                f"start={self._format_xyz(start)}, goal={self._format_xyz(goal)}"
+            )
+        logger.info(
+            "Projected route endpoints scenario=%r start=%s goal=%s",
+            scenario.name,
+            self._format_xyz(start_wp.transform.location),
+            self._format_xyz(goal_wp.transform.location),
+        )
+        self._route_start_location = start_wp.transform.location
+        self._route_goal_location = goal_wp.transform.location
         try:
             waypoints = self._pcla_module.location_to_waypoint(
                 self._client,
@@ -651,7 +826,11 @@ class PclaAV:
                 draw=self._route_draw,
             )
         except Exception as exc:
-            raise AvPreconditionFailed("PCLA route planner failed") from exc
+            raise AvPreconditionFailed(
+                "PCLA route planner failed: "
+                f"start={self._format_xyz(start_wp.transform.location)}, "
+                f"goal={self._format_xyz(goal_wp.transform.location)}"
+            ) from exc
         if len(waypoints) < 2:
             raise AvPreconditionFailed("PCLA route planner returned fewer than two waypoints")
         endpoints = [waypoints[0], waypoints[-1]]
@@ -679,16 +858,66 @@ class PclaAV:
                     temp_path.unlink()
         return route_path
 
+    @staticmethod
+    def _normalize_degrees(angle: float) -> float:
+        return (angle + 180.0) % 360.0 - 180.0
+
+    def _log_driving_state(self, kinematic: Any, action: Any) -> None:
+        interval = getattr(self, "_debug_log_interval_steps", 20)
+        if interval == 0 or (self._step_count > 3 and self._step_count % interval != 0):
+            return
+        try:
+            transform = self._vehicle.get_transform()
+            velocity = self._vehicle.get_velocity()
+        except Exception:
+            logger.debug("Unable to collect shadow CARLA actor state for diagnostics", exc_info=True)
+            return
+        actor_speed = math.sqrt(
+            float(velocity.x) ** 2 + float(velocity.y) ** 2 + float(velocity.z) ** 2
+        )
+        route_heading = None
+        heading_error = None
+        if self._route_start_location is not None and self._route_goal_location is not None:
+            route_heading = math.degrees(
+                math.atan2(
+                    self._route_goal_location.y - self._route_start_location.y,
+                    self._route_goal_location.x - self._route_start_location.x,
+                )
+            )
+            heading_error = self._normalize_degrees(route_heading - transform.rotation.yaw)
+        logger.info(
+            "Driving state step=%d timestamp_ns=%d "
+            "PISA pose=(%.3f, %.3f, %.3f) yaw_rad=%.6f speed=%.3f "
+            "CARLA pose=%s yaw_deg=%.3f speed=%.3f "
+            "route_heading_deg=%s heading_error_deg=%s "
+            "control_raw=(throttle=%.3f brake=%.3f steer=%.3f) output_steer=%.3f",
+            self._step_count,
+            self._last_timestamp_ns,
+            *self._extract_xyz(kinematic),
+            float(kinematic.yaw),
+            float(kinematic.speed),
+            self._format_xyz(transform.location),
+            float(transform.rotation.yaw),
+            actor_speed,
+            "n/a" if route_heading is None else f"{route_heading:.3f}",
+            "n/a" if heading_error is None else f"{heading_error:.3f}",
+            float(action.throttle),
+            float(action.brake),
+            float(action.steer),
+            float(action.steer) / self._steer_sign,
+        )
+
     def _build_pcla(self, route_path: Path):
         self._ensure_pcla_imports()
         try:
-            return self._pcla_module.PCLA(
-                self._agent_name,
-                self._vehicle,
-                str(route_path),
-                self._client,
-                destroy_vehicle=False,
-            )
+            with self._in_pcla_runtime_dir():
+                return self._pcla_module.PCLA(
+                    self._agent_name,
+                    self._vehicle,
+                    str(route_path),
+                    self._client,
+                    destroy_vehicle=False,
+                )
         except TimeoutError as exc:
             raise AvTimeout(f"Timed out loading PCLA agent {self._agent_name!r}") from exc
         except (FileNotFoundError, ImportError, ModuleNotFoundError) as exc:
@@ -696,15 +925,36 @@ class PclaAV:
                 f"PCLA agent {self._agent_name!r} dependencies or weights are unavailable: {exc}"
             ) from exc
 
+    def _prepare_pcla_sensors(self) -> None:
+        sensors = getattr(self._pcla, "_sensors", ())
+        has_camera = any(
+            str(getattr(sensor, "type_id", "")).startswith("sensor.camera.") for sensor in sensors
+        )
+        if has_camera:
+            settings = self._world.get_settings()
+            if settings.no_rendering_mode:
+                logger.warning("PCLA agent uses camera sensors; disabling CARLA no-rendering mode")
+                settings.no_rendering_mode = False
+                self._world.apply_settings(settings)
+
+        for _ in range(self._sensor_warmup_ticks):
+            self._raise_if_owned_server_exited()
+            if self._sync:
+                self._world.tick()
+            else:
+                self._world.wait_for_tick()
+            self._raise_if_owned_server_exited()
+
     def _get_action(self, snapshot: Any):
         deadline = time.monotonic() + self._action_none_timeout
         while True:
-            try:
-                action = self._pcla.get_action(snapshot=snapshot)
-            except TypeError as exc:
-                if "snapshot" not in str(exc):
-                    raise
-                action = self._pcla.get_action()
+            with self._in_pcla_runtime_dir():
+                try:
+                    action = self._pcla.get_action(snapshot=snapshot)
+                except TypeError as exc:
+                    if "snapshot" not in str(exc):
+                        raise
+                    action = self._pcla.get_action()
             if action is not None or self._action_none_timeout <= 0:
                 return action
             if time.monotonic() >= deadline:
@@ -879,7 +1129,8 @@ class PclaAV:
     def _finalize(self) -> None:
         if self._pcla is not None:
             try:
-                self._pcla.cleanup()
+                with self._in_pcla_runtime_dir():
+                    self._pcla.cleanup()
             except Exception:
                 logger.exception("Failed to cleanup PCLA")
             self._pcla = None
@@ -896,17 +1147,45 @@ class PclaAV:
             return
         try:
             if process.poll() is None:
-                process.terminate()
+                self._signal_server_process_group(process, signal.SIGTERM)
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    self._signal_server_process_group(process, signal.SIGKILL)
                     process.wait(timeout=10)
         except Exception:
             logger.exception("Failed to terminate owned CARLA server")
         finally:
             self._server_process = None
             self._server_owned = False
+
+    @staticmethod
+    def _signal_server_process_group(process: Any, sig: signal.Signals) -> None:
+        try:
+            os.killpg(process.pid, sig)
+        except (AttributeError, ProcessLookupError, OSError):
+            if sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+
+    def _raise_if_owned_server_exited(self) -> None:
+        process = self._server_process
+        if not self._server_owned or process is None:
+            return
+        return_code = process.poll()
+        if return_code is None:
+            return
+        message = self._owned_server_exit_message(return_code)
+        self._set_fatal_error(message)
+        raise AvUnavailable(message)
+
+    def _owned_server_exit_message(self, return_code: int) -> str:
+        log_dir = self._output_base / "carla_server"
+        return (
+            f"Owned CARLA server exited with return code {return_code}; inspect "
+            f"{log_dir / 'stderr.log'} and {log_dir / 'stdout.log'}"
+        )
 
     def _set_fatal_error(self, message: str) -> None:
         self._last_error = message

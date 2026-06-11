@@ -6,6 +6,12 @@
 #
 # The simulation step size is not configured here. It is supplied by
 # InitRequest.dt and becomes CARLA fixed_delta_seconds.
+#
+# Output paths are also lifecycle request fields rather than config keys:
+# - InitRequest.output_dir is the writable output base, normally /mnt/output.
+# - A relative ResetRequest.output_dir is resolved below that base.
+#   Example: base /mnt/output plus reset path concrete becomes
+#   /mnt/output/concrete.
 
 # -----------------------------------------------------------------------------
 # PCLA agent and model
@@ -19,6 +25,14 @@ pcla_agent: carl_plant_3
 # PCLA source root containing PCLA.py, agents.json, leaderboard_codes, and
 # pcla_agents. The Docker image uses this path.
 pcla_root: /app/PCLA-wrapper/PCLA
+
+# Writable current working directory used while constructing, running, and
+# cleaning the upstream PCLA agent.
+# - null: use <ResetRequest.output_dir>/pcla_runtime.
+# - relative path: resolve below ResetRequest.output_dir; escaping it is rejected.
+# - absolute path: use directly.
+# Relative agent outputs such as plant_viz are created below this directory.
+pcla_runtime_dir: null
 
 # -----------------------------------------------------------------------------
 # Route
@@ -69,6 +83,11 @@ max_retry_times: 15
 # OpenDRIVE generation timeout increases. CARLA_TIMEOUT takes precedence.
 carla_timeout: 10.0
 
+# Writable home used by the owned CARLA process for carlaCache navigation data.
+# Relative paths are resolved by the wrapper process. CARLA_HOME takes
+# precedence. The Docker image defaults CARLA_HOME to /mnt/output/.carla-home.
+carla_home: /mnt/output/.carla-home
+
 # Optional local CARLA Python API discovery paths. The Docker image already
 # installs CARLA 0.9.16, so normal container runs should leave these commented.
 # carla_root: /opt/carla
@@ -82,10 +101,17 @@ carla_timeout: 10.0
 # one CARLA tick before PCLA inference.
 sync: true
 
-# Disable rendering while preserving physics and sensor production.
-# Some camera-based PCLA agents may require rendering; set false for those
-# agents if no-rendering mode prevents their sensors from producing data.
-no_rendering: true
+# Disable rendering when the selected agent has no camera sensors.
+# The wrapper automatically turns this off when PCLA creates a camera sensor.
+no_rendering: false
+
+# CARLA frames to run after PCLA sensor attachment and before the initial Step.
+# Increase only when an unusually slow server needs more sensor startup time.
+sensor_warmup_ticks: 1
+
+# Log the first three driving frames and then every N steps. The log includes
+# PISA/CARLA pose, heading error, speed, and raw/output control. Set 0 to disable.
+debug_log_interval_steps: 20
 
 # Directory containing OpenDRIVE maps. Reset resolves ScenarioPack.map_name as
 # {xodr_root}/{map_name}.xodr.
@@ -162,5 +188,13 @@ action_none_timeout_seconds: 0.0
 # CARLA_PORT       Overrides carla_port.
 # CARLA_TIMEOUT    Overrides carla_timeout.
 # CARLA_TM_PORT    TrafficManager port used only when management is enabled.
+# CARLA_HOME       Writable HOME for the owned CARLA process and carlaCache.
 # CARLA_ROOT       Fallback CARLA Python API root when carla_root is absent.
+# CARLA_QUALITY_LEVEL  Rendered server quality. Default: Low; ignored by NullRHI.
+# CARLA_NULLRHI    Set to 1 only for sensorless debugging; disables cameras.
+# CARLA_RUN_UID    Owned CARLA child UID when service runs as root. Default: 1000.
+# CARLA_RUN_GID    Owned CARLA child GID when service runs as root. Default: 1000.
+# DISPLAY          Host X display used by internal CARLA Unreal/Vulkan startup.
+# XAUTHORITY       Optional explicit Xauthority path; the launcher also detects
+#                  /home/carla/.Xauthority and /root/.Xauthority.
 # PORT             PISA AV gRPC service port. Default: 50051.

@@ -5,3 +5,5 @@ __pycache__
 .ruff_cache
 tests
 PCLA_WRAPPER_CODEX_PROMPT.md
+
+output/

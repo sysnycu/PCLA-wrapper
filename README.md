@@ -15,17 +15,18 @@ The server exposes the standard `pisa-api>=0.3.0` AV lifecycle:
 - `Step`: synchronize ego and non-ego actors, tick once, then run PCLA.
 - `ShouldQuit`: report route completion, PCLA failures, or owned CARLA process
   exits with a diagnostic message.
-- `Stop`: idempotently clean PCLA-owned sensors, wrapper-owned actors, and an
-  owned CARLA process.
+- `Stop`: idempotently clean PCLA-owned sensors and wrapper-owned actors while
+  keeping the container-owned CARLA process available for the next Init/Reset.
 
 The Python package is `pcla_wrapper`. `PCLA-wrapper/` only contains legacy
 entry-point shims and the upstream PCLA submodule.
 
 ## Runtime Contract
 
-The Docker image is based on:
+The Docker image uses:
 
-- PCLA base:
+- Ubuntu 24.04 as the final CARLA-compatible runtime.
+- PCLA runtime copied from the pinned base:
   `sys511613/pcla@sha256:698fb44c2b9b3a142304f37761a8c1c05dd7cf0a2983736657980c577e72326d`
 - Python 3.8.18
 - PyTorch 2.2.0+cu121
@@ -33,8 +34,9 @@ The Docker image is based on:
 - CARLA server and Python API 0.9.16
 - PISA API 0.3.1, pinned by `uv.lock`
 
-The PCLA base image provides model/framework dependencies. The top-level
-`pyproject.toml` manages only the wrapper API and development tools.
+The pinned PCLA stage provides the Conda, PyTorch, CUDA, and model/framework
+dependencies. The top-level `pyproject.toml` manages only the wrapper API and
+development tools.
 `requirements.txt` is retained as a legacy environment inventory and is not an
 input to `uv sync`.
 
@@ -75,7 +77,8 @@ launch_carla_server: true
 carla_connect_timeout_seconds: 30.0
 retry_interval_seconds: 2.0
 sync: true
-no_rendering: true
+no_rendering: false
+sensor_warmup_ticks: 1
 xodr_root: /mnt/map/xodr
 reuse_generated_world: true
 coordinate_y_sign: -1.0
@@ -125,7 +128,8 @@ launch_carla_server: false
 ```
 
 Set `CARLA_HOST` and `CARLA_PORT` to the external endpoint. Only a process
-launched by this wrapper is terminated by `Stop`.
+launched by this wrapper is reused across Init/Reset cycles and exits with the
+container.
 
 ## Build And Run
 
@@ -140,11 +144,18 @@ Typical volumes:
 
 ```bash
 docker run --rm --gpus all --network host \
+  -e DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v "$HOME/.Xauthority":/home/carla/.Xauthority:ro \
   -v /path/to/xodr:/mnt/map/xodr:ro \
   -v /path/to/output:/mnt/output \
   -v /path/to/weights:/app/PCLA-wrapper/PCLA/pcla_agents/plant/weights:ro \
   pcla-wrapper
 ```
+
+This still launches CARLA inside the PCLA container. The X11 mounts only provide
+the display authorization required by Unreal/Vulkan on supported NVIDIA hosts;
+they do not connect to an external CARLA server.
 
 The exact weights mount target depends on the selected entry in `agents.json`.
 PISA sends `output_dir`, `dt`, config, scenario, and observations through the AV

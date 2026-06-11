@@ -4,6 +4,16 @@ The wrapper receives configuration through `pisa_api.av.InitRequest.config`.
 Use a flat mapping as shown in [`config_example.yaml`](../config_example.yaml).
 The simulation time step is supplied separately as `InitRequest.dt`.
 
+Output paths are lifecycle fields:
+
+- `InitRequest.output_dir` is the writable output base.
+- An absolute `ResetRequest.output_dir` is used directly.
+- A relative `ResetRequest.output_dir` is resolved below the Init base.
+- Relative reset paths containing `..` may not escape the Init base.
+
+For example, Init base `/mnt/output` and Reset path `concrete` produce
+`/mnt/output/concrete`.
+
 ## Precedence
 
 Values are resolved in this order:
@@ -23,6 +33,7 @@ values, Init fails with `InvalidAvRequest`.
 | --- | --- | --- |
 | `pcla_agent` | `carl_plant_3` | Registry name `<family>_<variant>[_seed]`. |
 | `pcla_root` | Repository PCLA submodule | Directory containing `PCLA.py` and `agents.json`. |
+| `pcla_runtime_dir` | `<reset output>/pcla_runtime` | Writable working directory for upstream agent code. |
 | `route_xml_path` | `null` | Existing route XML, or generate one from scenario start/goal. |
 | `route_waypoint_distance` | `2.0` | Route planner sampling distance in meters. |
 | `route_draw` | `false` | Draw route debug markers in CARLA. |
@@ -31,6 +42,12 @@ values, Init fails with `InvalidAvRequest`.
 `route_xml_path` is resolved relative to `pcla_root` unless it is absolute.
 Generated routes are written below
 `<ResetRequest.output_dir>/pcla_routes/`.
+
+Relative `pcla_runtime_dir` values are resolved below the current Reset output
+directory and may not escape it. Absolute values are used directly. The wrapper
+temporarily enters this directory only while constructing, running, or cleaning
+PCLA, then restores its original working directory. Relative upstream outputs
+such as `plant_viz` therefore remain isolated in the current scenario output.
 
 ## CARLA Connection And Process
 
@@ -44,18 +61,25 @@ Generated routes are written below
 | `retry_interval_seconds` | `2.0` | Delay between connection attempts. |
 | `max_retry_times` | `15` | Legacy fallback used only when total timeout is omitted. |
 | `carla_timeout` | `10.0` | Normal CARLA RPC timeout. |
+| `carla_home` | `<output_dir>/carla_home` | Writable HOME containing CARLA navigation cache. |
 | `carla_root` | unset | Optional local CARLA Python API root. |
 | `carla_egg` | unset | Optional CARLA wheel/egg path. |
 
 The wrapper terminates CARLA only when it launched that process. For an
 external server, set `launch_carla_server: false`.
 
+`CARLA_HOME` overrides `carla_home`. The Docker image sets it to
+`/mnt/output/.carla-home`. The wrapper creates `carlaCache` and `.cache`
+below this directory before starting CARLA. Do not set it to `/` or a
+read-only path.
+
 ## World And Actors
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `sync` | `true` | Use CARLA synchronous mode. |
-| `no_rendering` | `true` | Disable rendering. Camera agents may require `false`. |
+| `no_rendering` | `false` | Disable rendering for sensorless agents; camera sensors override it to `false`. |
+| `sensor_warmup_ticks` | `1` | CARLA ticks after sensor attachment and before initial inference. |
 | `xodr_root` | `/mnt/map/xodr` | OpenDRIVE map directory. |
 | `reuse_generated_world` | `true` | Reuse an unchanged generated map between resets. |
 | `manage_traffic_manager_sync` | `false` | Set TrafficManager async during cleanup. |
@@ -72,6 +96,14 @@ Identity modes:
 
 Observation-controlled non-ego actors have physics and gravity disabled. Ego
 physics remains enabled.
+
+The owned CARLA launcher uses offscreen rendering with low quality by default.
+`CARLA_QUALITY_LEVEL` changes the rendered-mode quality level.
+`CARLA_NULLRHI=1` is an explicit sensorless mode and prevents camera sensors
+from working. Quality arguments are omitted in NullRHI mode because CARLA
+0.9.16 crashes when both options are supplied.
+When the wrapper service runs as root, only the CARLA child is dropped to
+`CARLA_RUN_UID`/`CARLA_RUN_GID`, both defaulting to `1000`.
 
 ## Coordinates
 

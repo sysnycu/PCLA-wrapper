@@ -3,6 +3,7 @@
 # precedence, validation, and legacy nested-config behavior.
 pcla_agent: carl_plant_3
 pcla_root: /app/PCLA-wrapper/PCLA
+pcla_runtime_dir: null
 route_xml_path: null
 route_waypoint_distance: 2.0
 route_draw: false
@@ -11,9 +12,12 @@ launch_carla_server: true
 carla_connect_timeout_seconds: 30.0
 retry_interval_seconds: 2.0
 carla_timeout: 10.0
+carla_home: /mnt/output/.carla-home
 
 sync: true
-no_rendering: true
+no_rendering: false
+sensor_warmup_ticks: 1
+debug_log_interval_steps: 20
 xodr_root: /mnt/map/xodr
 reuse_generated_world: true
 manage_traffic_manager_sync: false
