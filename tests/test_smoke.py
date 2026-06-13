@@ -326,9 +326,11 @@ def test_pretrained_weights_are_external_and_reproducible():
     ) in dockerignore
     assert 'ln -s "/opt/pcla-pretrained/${name}"' in dockerfile
     assert "ENV PCLA_PRETRAINED_ROOT=/opt/pcla-pretrained" in dockerfile
+    assert "ENV CUBLAS_WORKSPACE_CONFIG=:4096:8" in dockerfile
     assert 'map_name == "OpenDriveMap"' in dockerfile
     assert "MapImage.draw_map_image" in dockerfile
     assert 'export PCLA_PRETRAINED_ROOT="${PCLA_PRETRAINED_ROOT:-' in entrypoint
+    assert 'export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"' in entrypoint
     assert "https://github.com/sysnycu/PCLA.git" in gitmodules
     assert "branch = pisa-integration" in gitmodules
     assert "curl -fL --retry 5" in downloader
@@ -1315,6 +1317,29 @@ def test_pcla_cleanup_only_owned_sensors_and_does_not_destroy_ego(monkeypatch):
     assert agent.destroy_calls == 1
     assert module.CarlaDataProvider._carla_actor_pool == {}
     assert module.CarlaDataProvider._world is None
+
+
+def test_pcla_resets_process_global_torch_state_between_agents(monkeypatch):
+    calls = []
+    cudnn = SimpleNamespace(benchmark=True, deterministic=True)
+    fake_torch = SimpleNamespace(
+        float32=object(),
+        backends=SimpleNamespace(cudnn=cudnn),
+        set_default_dtype=lambda dtype: calls.append(("dtype", dtype)),
+        use_deterministic_algorithms=lambda enabled: calls.append(("deterministic", enabled)),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    module = load_upstream_pcla(monkeypatch)
+
+    module._reset_torch_runtime_state()
+
+    assert calls == [
+        ("dtype", fake_torch.float32),
+        ("deterministic", False),
+    ]
+    assert cudnn.benchmark is False
+    assert cudnn.deterministic is False
+    assert "CUBLAS_WORKSPACE_CONFIG" in module.os.environ
 
 
 def test_pcla_done_delegates_to_agent(monkeypatch):

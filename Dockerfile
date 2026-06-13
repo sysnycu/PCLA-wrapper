@@ -104,5 +104,6 @@ ENV CARLA_TM_PORT=8000
 ENV CARLA_HOME=/mnt/output/.carla-home
 ENV HOME=/mnt/output/.carla-home
 ENV PCLA_PRETRAINED_ROOT=/opt/pcla-pretrained
+ENV CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 ENTRYPOINT ["/app/entrypoint.sh"]
