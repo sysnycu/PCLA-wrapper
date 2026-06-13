@@ -16,6 +16,7 @@ Examples:
 
 | Name | Registry selection |
 | --- | --- |
+| `plant2_plant2_0` | PlanT 2.0, seed 0 |
 | `carl_plant_3` | CaRL family, PlanT variant, seed suffix `3` |
 | `tfv5_alltowns` | TransFuser v5 all-towns variant |
 | `tfv6_regnet` | TransFuser v6 RegNet variant |
@@ -45,20 +46,41 @@ PCLA-wrapper/PCLA/pcla_agents/plant/config/
 PCLA-wrapper/PCLA/pcla_agents/plant/weights/
 ```
 
-The fixed PCLA base image supplies its model environment. Additional or updated
-weights can be baked into a derived image or mounted directly over the expected
-directory:
+Download and validate the official PCLA archive from the repository root:
+
+```bash
+./scripts/download_pcla_pretrained.sh
+```
+
+The script resumes partial downloads, verifies SHA-256
+`0d02c1aaf9ea81b892fef8815c1a8ab617c1906b89ee984ba8163332d659fa93`,
+extracts without overwriting existing files, and validates the registry paths.
+Set `PCLA_KEEP_PRETRAINED_ARCHIVE=1` to retain the downloaded ZIP.
+
+The fixed PCLA base image supplies the Python/model environment. The weights
+are excluded from Docker builds and mounted read-only:
 
 ```bash
 docker run --rm --gpus all --network host \
   -v /host/maps:/mnt/map/xodr:ro \
   -v /host/output:/mnt/output \
-  -v /host/plant-weights:/app/PCLA-wrapper/PCLA/pcla_agents/plant/weights:ro \
+  -v "$PWD/PCLA-wrapper/PCLA/pcla_agents:/opt/pcla-pretrained:ro" \
   pcla-wrapper
 ```
 
-Check the selected `agents.json` entry before choosing a mount target. Mounting
-the wrong directory can hide files included in the image.
+The image creates links for the official `*_pretrained` directories during
+build. They point to the fixed runtime mount `/opt/pcla-pretrained`, so startup
+does not write below `/app` and works with Docker's `--user` option.
+
+PlanT also resolves its checkpoint directly through `PCLA_PRETRAINED_ROOT` if
+the source-tree link is unavailable. A missing checkpoint error lists every
+path checked by the agent.
+
+LMDrive checkpoints in the archive are adapters for external Hugging Face base
+models such as LLaVA, Vicuna, and LLaMA. SimLingo also loads its configured
+vision/language base model through Transformers. Their first run therefore
+needs network access or a populated Hugging Face cache in addition to this
+archive. Model access terms and GPU memory requirements still apply.
 
 ## Rendering And Sensors
 
@@ -73,6 +95,28 @@ Sensor requirements differ by agent:
 
 PCLA owns only sensors created for its current instance. The wrapper owns the
 ego and observation-controlled actors.
+
+### Camera Matrix
+
+The following registry selections create camera sensors and require rendering:
+
+- `tfv3_*`, `tfv4_*`, `tfv5_*`, and `tfv6_*`
+- `neat_*`
+- `lav_*`
+- `lbc_*` and `wor_*`
+- `lmdrive_*`
+- `simlingo_simlingo`
+- `if_if`
+
+The following selections do not use camera input:
+
+- `plant2_plant2_[0-2]` while `PLANT_VIZ` is empty
+- `carl_carl_*`, `carl_carlv11`, and `carl_roach_*`
+- `carl_plant*` while its YAML has `visualize: false`
+
+PlanT adds one RGB camera only when `visualize: true`. PlanT 2 behaves the same
+way when `PLANT_VIZ` is non-empty. These cameras are for visualization rather
+than driving model input.
 
 ## Validation Scope
 

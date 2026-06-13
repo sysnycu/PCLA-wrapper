@@ -52,8 +52,38 @@ RUN uv pip install --python /opt/conda/envs/PCLA/bin/python \
     && rm /tmp/carla-0.9.16-cp38-cp38-linux_x86_64.whl
 
 COPY . /app
+RUN set -eux; \
+    for name in \
+        carl_pretrained \
+        interfuser_pretrained \
+        lav_pretrained \
+        lmdrive_pretrained \
+        neat_pretrained \
+        plant2_pretrained \
+        plant_pretrained \
+        simlingo_pretrained \
+        transfuserv3_pretrained \
+        transfuserv4_pretrained \
+        transfuserv5_pretrained \
+        transfuserv6_pretrained \
+        wor_pretrained; \
+    do \
+        ln -s "/opt/pcla-pretrained/${name}" \
+            "/app/PCLA-wrapper/PCLA/pcla_agents/${name}"; \
+    done
+RUN uv pip install --python /opt/conda/envs/PCLA/bin/python \
+        --find-links https://data.pyg.org/whl/torch-2.2.0+cu121.html \
+        "torch-scatter==2.1.2" \
+        "ftfy==6.1.1" \
+    && uv pip install --python /opt/conda/envs/PCLA/bin/python --no-deps \
+        --editable /app/PCLA-wrapper/PCLA/pcla_agents/lmdrive/vision_encoder \
+        --editable /app/PCLA-wrapper/PCLA/pcla_agents/lmdrive/LAVIS
 RUN test -f /app/PCLA-wrapper/PCLA/PCLA.py \
-    && chmod +x /app/entrypoint.sh /app/carla_server.sh
+    && chmod +x \
+        /app/entrypoint.sh \
+        /app/carla_server.sh \
+        /app/scripts/download_pcla_pretrained.sh \
+        /app/scripts/validate_pcla_pretrained.py
 
 ENV PATH=/opt/conda/envs/PCLA/bin:/opt/conda/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
@@ -69,6 +99,6 @@ ENV CARLA_TIMEOUT=120
 ENV CARLA_TM_PORT=8000
 ENV CARLA_HOME=/mnt/output/.carla-home
 ENV HOME=/mnt/output/.carla-home
-ENV XDG_CACHE_HOME=/mnt/output/.carla-home/.cache
+ENV PCLA_PRETRAINED_ROOT=/opt/pcla-pretrained
 
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -293,13 +293,13 @@ def test_owned_carla_launcher_preserves_rendering_and_drops_root():
     source = Path("carla_server.sh").read_text(encoding="utf-8")
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     assert "-RenderOffScreen" in source
-    assert 'CARLA_NULLRHI:-0' in source
+    assert "CARLA_NULLRHI:-0" in source
     assert 'else\n    args+=("-quality-level=' in source
     assert 'cd "${CARLA_ROOT}"' in source
     assert "carla-rpc-timeout" in source
     assert "carla-tm-port" in source
-    assert 'CARLA_RUN_UID:-$(id -u carla)' in source
-    assert 'CARLA_RUN_GID:-$(id -g carla)' in source
+    assert "CARLA_RUN_UID:-$(id -u carla)" in source
+    assert "CARLA_RUN_GID:-$(id -g carla)" in source
     assert "setpriv" in source
     assert "/root/.Xauthority" in source
     assert "XDG_RUNTIME_DIR" in source
@@ -312,10 +312,26 @@ def test_owned_carla_launcher_preserves_rendering_and_drops_root():
     assert Path("docker/nvidia_icd.json").is_file()
 
 
+def test_pretrained_weights_are_external_and_reproducible():
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    dockerignore = Path(".dockerignore").read_text(encoding="utf-8")
+    entrypoint = Path("entrypoint.sh").read_text(encoding="utf-8")
+    gitmodules = Path(".gitmodules").read_text(encoding="utf-8")
+    downloader = Path("scripts/download_pcla_pretrained.sh").read_text(encoding="utf-8")
+
+    assert "PCLA-wrapper/PCLA/pcla_agents/*_pretrained/" in dockerignore
+    assert 'ln -s "/opt/pcla-pretrained/${name}"' in dockerfile
+    assert "ENV PCLA_PRETRAINED_ROOT=/opt/pcla-pretrained" in dockerfile
+    assert 'export PCLA_PRETRAINED_ROOT="${PCLA_PRETRAINED_ROOT:-' in entrypoint
+    assert "https://github.com/sysnycu/PCLA.git" in gitmodules
+    assert "branch = pisa-integration" in gitmodules
+    assert "curl -fL --retry 5" in downloader
+    assert "sha256sum --check -" in downloader
+    assert "scripts/validate_pcla_pretrained.py" in downloader
+
+
 def test_plant_route_planner_uses_world_coordinates():
-    source = Path(
-        "PCLA-wrapper/PCLA/pcla_agents/plant/PlanT_agent.py"
-    ).read_text(encoding="utf-8")
+    source = Path("PCLA-wrapper/PCLA/pcla_agents/plant/PlanT_agent.py").read_text(encoding="utf-8")
     assert "set_route(self._global_plan_world_coord, False)" in source
     assert "set_route(self._global_plan, True)" not in source
     assert "downsample_route(global_plan_world_coord, 50)" in source
@@ -325,11 +341,26 @@ def test_plant_route_planner_uses_world_coordinates():
 
 def test_plant_privileged_route_index_tracks_actual_prefix():
     source = Path(
-        "PCLA-wrapper/PCLA/pcla_agents/plant/carla_garage/"
-        "privileged_route_planner.py"
+        "PCLA-wrapper/PCLA/pcla_agents/plant/carla_garage/privileged_route_planner.py"
     ).read_text(encoding="utf-8")
     assert "self.route_index = 0" in source
     assert "self.route_index += self.points_per_meter" in source
+
+
+def test_neat_agents_use_world_route_in_native_coordinate_frame():
+    planner = Path("PCLA-wrapper/PCLA/pcla_agents/neat/planner.py").read_text(encoding="utf-8")
+    assert "def set_route_world(self, global_plan):" in planner
+    assert "np.array([-location.y, location.x])" in planner
+
+    for agent_path in (
+        "PCLA-wrapper/PCLA/pcla_agents/neat/neat_agent.py",
+        "PCLA-wrapper/PCLA/pcla_agents/neat/aim_mt_2d_agent.py",
+        "PCLA-wrapper/PCLA/pcla_agents/neat/aim_mt_bev_agent.py",
+    ):
+        source = Path(agent_path).read_text(encoding="utf-8")
+        assert "set_route_world(self._global_plan_world_coord)" in source
+        assert "set_route(self._global_plan, True)" not in source
+        assert "return np.array([-location.y, location.x])" in source
 
 
 def test_constructor_is_lazy():
@@ -776,9 +807,7 @@ def test_driving_state_log_includes_heading_and_converted_steer(caplog):
     adapter._steer_sign = -1.0
     adapter._route_start_location = FakeLocation(0, 0, 0)
     adapter._route_goal_location = FakeLocation(100, 0, 0)
-    adapter._vehicle.transform = FakeTransform(
-        FakeLocation(5, 0, 0), FakeRotation(yaw=10)
-    )
+    adapter._vehicle.transform = FakeTransform(FakeLocation(5, 0, 0), FakeRotation(yaw=10))
     adapter._vehicle.velocity = FakeVector(3, 4, 0)
     adapter._vehicle.get_transform = lambda: adapter._vehicle.transform
     adapter._vehicle.get_velocity = lambda: adapter._vehicle.velocity

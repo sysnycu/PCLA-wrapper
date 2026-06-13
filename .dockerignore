@@ -7,3 +7,8 @@ tests
 PCLA_WRAPPER_CODEX_PROMPT.md
 
 output/
+
+# PCLA's official archive expands to more than 40 GiB. Keep weights on the
+# host and mount pcla_agents at /opt/pcla-pretrained; entrypoint.sh links only
+# the *_pretrained directories into the image's PCLA source tree.
+PCLA-wrapper/PCLA/pcla_agents/*_pretrained/

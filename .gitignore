@@ -1,6 +1,7 @@
-**.py[cod]
-
-PCLA/plant_viz
-PCLA/pcla_agents/**_pretrinained
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
 
 output/

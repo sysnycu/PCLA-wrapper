@@ -37,6 +37,10 @@ The Docker image uses:
 The pinned PCLA stage provides the Conda, PyTorch, CUDA, and model/framework
 dependencies. The top-level `pyproject.toml` manages only the wrapper API and
 development tools.
+The final image also installs PCLA's LMDrive-specific custom `timm`, LAVIS,
+`torch-scatter`, and pinned `ftfy` requirements.
+Upstream PCLA now documents Python 3.10, but this wrapper intentionally retains
+the tested Python 3.8 runtime from its pinned PCLA image and CARLA wheel.
 `requirements.txt` is retained as a legacy environment inventory and is not an
 input to `uv sync`.
 
@@ -50,6 +54,7 @@ Agent names use:
 
 Examples:
 
+- `plant2_plant2_0`
 - `carl_plant_3`
 - `tfv5_alltowns`
 - `tfv6_regnet`
@@ -58,7 +63,9 @@ Examples:
 Names are validated against `PCLA-wrapper/PCLA/agents.json` before model import.
 Weights and agent-specific configuration must exist at the paths referenced by
 that registry, normally below `PCLA-wrapper/PCLA/pcla_agents/*_pretrained`.
-Large weights may be supplied by the base image or mounted into those paths.
+The official archive is kept outside the image and mounted read-only because it
+expands to more than 40 GiB. Build-time links point the upstream PCLA paths to
+the fixed `/opt/pcla-pretrained` runtime mount.
 Missing model files surface as an AV availability error.
 
 The wrapper's fake-based suite validates the PlanT-compatible code path and
@@ -137,8 +144,13 @@ Initialize the upstream code first:
 
 ```bash
 git submodule update --init --recursive
+./scripts/download_pcla_pretrained.sh
 docker build -t pcla-wrapper .
 ```
+
+The download is resumable and verifies the official archive SHA-256 before
+extracting it. Pretrained directories are excluded by `.dockerignore`, so
+normal image rebuilds do not resend the weights to Docker.
 
 Typical volumes:
 
@@ -149,7 +161,7 @@ docker run --rm --gpus all --network host \
   -v "$HOME/.Xauthority":/home/carla/.Xauthority:ro \
   -v /path/to/xodr:/mnt/map/xodr:ro \
   -v /path/to/output:/mnt/output \
-  -v /path/to/weights:/app/PCLA-wrapper/PCLA/pcla_agents/plant/weights:ro \
+  -v "$PWD/PCLA-wrapper/PCLA/pcla_agents:/opt/pcla-pretrained:ro" \
   pcla-wrapper
 ```
 
@@ -157,7 +169,9 @@ This still launches CARLA inside the PCLA container. The X11 mounts only provide
 the display authorization required by Unreal/Vulkan on supported NVIDIA hosts;
 they do not connect to an external CARLA server.
 
-The exact weights mount target depends on the selected entry in `agents.json`.
+The image contains build-time links from each official `*_pretrained` path to
+`/opt/pcla-pretrained`. Startup therefore works with `--user` and does not need
+write permission under `/app`.
 PISA sends `output_dir`, `dt`, config, scenario, and observations through the AV
 service; the default gRPC port is `50051`.
 

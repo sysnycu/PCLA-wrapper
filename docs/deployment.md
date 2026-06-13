@@ -10,13 +10,25 @@ The provided Dockerfile uses:
 - PyTorch 2.2.0+cu121 and CUDA 12.1 from the PCLA base.
 - CARLA server and Python API 0.9.16.
 - PISA API pinned by `uv.lock`.
+- LMDrive custom vision encoder/LAVIS packages, `torch-scatter`, and
+  `ftfy==6.1.1`.
+
+Upstream PCLA changed its environment specification to Python 3.10 in March
+2026. This wrapper keeps the pinned, tested Python 3.8 environment because its
+runtime base and bundled CARLA API wheel use CPython 3.8.
 
 Initialize the submodule before building:
 
 ```bash
 git submodule update --init --recursive
+./scripts/download_pcla_pretrained.sh
 docker build -t pcla-wrapper .
 ```
+
+The pretrained archive expands to more than 40 GiB and is excluded from the
+Docker build context. Mount it at runtime instead of baking it into the image.
+The image creates the required links at build time; the entrypoint does not
+need write permission below `/app`.
 
 ## Required Volumes
 
@@ -24,7 +36,7 @@ docker build -t pcla-wrapper .
 | --- | --- |
 | `/mnt/map/xodr` | `<ScenarioPack.map_name>.xodr` files. |
 | `/mnt/output` | PISA output and CARLA server logs. |
-| Agent-specific PCLA paths | Optional external weights/checkpoints. |
+| `/opt/pcla-pretrained` | Host `pcla_agents` directory containing official `*_pretrained` folders. |
 
 The request output directory should be under the mounted output path. Generated
 routes are isolated below each reset output directory.
@@ -35,6 +47,9 @@ write relative paths below `/app`.
 
 The Docker image also uses `/mnt/output/.carla-home` for CARLA navigation cache.
 The output volume must therefore be writable by the container process.
+When using `--user`, either make that volume writable by the selected UID or
+set `CARLA_HOME` to another writable path. `XDG_CACHE_HOME` follows
+`CARLA_HOME`; `PCLA_XDG_CACHE_HOME` can override it separately.
 
 ## Internal CARLA
 
@@ -82,6 +97,7 @@ docker run --rm --gpus all --network host \
   -v "$HOME/.Xauthority":/home/carla/.Xauthority:ro \
   -v /host/maps:/mnt/map/xodr:ro \
   -v /host/output:/mnt/output \
+  -v "$PWD/PCLA-wrapper/PCLA/pcla_agents:/opt/pcla-pretrained:ro" \
   pcla-wrapper
 ```
 

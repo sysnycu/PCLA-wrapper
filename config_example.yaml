@@ -19,12 +19,24 @@
 
 # Agent registry name in the form <family>_<variant>[_seed].
 # The family and variant must exist in PCLA-wrapper/PCLA/agents.json.
-# Examples: carl_plant_3, tfv5_alltowns, tfv6_regnet, neat_neat.
+# Examples: plant2_plant2_0, carl_plant_3, tfv5_alltowns, tfv6_regnet,
+# neat_neat.
 pcla_agent: carl_plant_3
 
 # PCLA source root containing PCLA.py, agents.json, leaderboard_codes, and
 # pcla_agents. The Docker image uses this path.
 pcla_root: /app/PCLA-wrapper/PCLA
+
+# Official pretrained weights are intentionally excluded from the Docker build
+# context. Mount the host pcla_agents directory at /opt/pcla-pretrained:ro.
+# The image contains links from pcla_root/pcla_agents/*_pretrained to this
+# fixed mount location. No startup write access to /app is required.
+#
+# docker run ... \
+#   -v "$PWD/PCLA-wrapper/PCLA/pcla_agents:/opt/pcla-pretrained:ro" \
+#   pcla-wrapper
+#
+# PCLA_PRETRAINED_ROOT is fixed to /opt/pcla-pretrained.
 
 # Writable current working directory used while constructing, running, and
 # cleaning the upstream PCLA agent.
@@ -184,6 +196,8 @@ action_none_timeout_seconds: 0.0
 #
 # PCLA_AGENT       Overrides pcla_agent.
 # PCLA_ROUTE       Overrides route_xml_path.
+# PCLA_PRETRAINED_ROOT  Must be /opt/pcla-pretrained.
+# PCLA_XDG_CACHE_HOME   Optional cache override; defaults to $CARLA_HOME/.cache.
 # CARLA_HOST       Overrides carla_host.
 # CARLA_PORT       Overrides carla_port.
 # CARLA_TIMEOUT    Overrides carla_timeout.

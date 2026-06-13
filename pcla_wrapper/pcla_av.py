@@ -193,9 +193,6 @@ class PclaAV:
                 self._quit_msg = "PCLA agent reached the route endpoint."
             self._step_count += 1
             self._log_driving_state(request.observation[0].kinematic, action)
-            print(
-                f"throttle={action.throttle:.3f} brake={action.brake:.3f} steer={action.steer:.3f}"
-            )
             return StepResponse(
                 ctrl_cmd=ControlCommand(
                     mode=ControlMode.THROTTLE_STEER_BREAK,
@@ -703,11 +700,7 @@ class PclaAV:
 
     @staticmethod
     def _format_xyz(position: Any) -> str:
-        return (
-            f"({float(position.x):.3f}, "
-            f"{float(position.y):.3f}, "
-            f"{float(position.z):.3f})"
-        )
+        return f"({float(position.x):.3f}, {float(position.y):.3f}, {float(position.z):.3f})"
 
     def _find_blueprint(self, library: Any, candidates: tuple[str, ...]):
         for pattern in candidates:
@@ -870,7 +863,9 @@ class PclaAV:
             transform = self._vehicle.get_transform()
             velocity = self._vehicle.get_velocity()
         except Exception:
-            logger.debug("Unable to collect shadow CARLA actor state for diagnostics", exc_info=True)
+            logger.debug(
+                "Unable to collect shadow CARLA actor state for diagnostics", exc_info=True
+            )
             return
         actor_speed = math.sqrt(
             float(velocity.x) ** 2 + float(velocity.y) ** 2 + float(velocity.z) ** 2
