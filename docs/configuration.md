@@ -1,7 +1,7 @@
 # Configuration
 
 The wrapper receives configuration through `pisa_api.av.InitRequest.config`.
-Use a flat mapping as shown in [`config_example.yaml`](../config_example.yaml).
+Use the flat mapping below as the canonical request configuration.
 The simulation time step is supplied separately as `InitRequest.dt`.
 
 Output paths are lifecycle fields:

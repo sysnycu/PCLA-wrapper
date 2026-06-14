@@ -35,6 +35,7 @@ from pisa_api.av import (
 )
 
 from .lifecycle import clear_dynamic_actors, destroy_actor, force_async_world_for_cleanup
+from .profiles import validate_image_profile
 
 logger = logging.getLogger(__name__)
 PCLA_CWD_LOCK = RLock()
@@ -104,6 +105,7 @@ class PclaAV:
             self._fixed_delta_seconds = self._positive_float("dt", request.dt)
             self._parse_config()
             self._validate_agent_name()
+            validate_image_profile(self._agent_name, self._pretrained_root)
             logger.info(
                 "CARLA mode=%s endpoint=%s:%s",
                 "owned" if self._launch_carla_server else "external",
@@ -328,7 +330,13 @@ class PclaAV:
 
     def _parse_config(self) -> None:
         default_root = Path(__file__).resolve().parents[1] / "PCLA"
-        self._pcla_root = Path(self.config.get("pcla_root", default_root)).resolve()
+        self._pcla_root = self._resolve_pcla_root(Path(self.config.get("pcla_root", default_root)))
+        self._pretrained_root = Path(
+            os.environ.get(
+                "PCLA_PRETRAINED_ROOT",
+                self.config.get("pcla_pretrained_root", "/opt/pcla-pretrained"),
+            )
+        ).resolve()
         self._agent_name = str(
             os.environ.get("PCLA_AGENT", self.config.get("pcla_agent", "carl_plant_3"))
         )
@@ -390,6 +398,24 @@ class PclaAV:
         self._debug_log_interval_steps = self._config_int("debug_log_interval_steps", 20)
         if self._debug_log_interval_steps < 0:
             raise InvalidAvRequest("debug_log_interval_steps must be non-negative")
+
+    @staticmethod
+    def _resolve_pcla_root(
+        configured_root: Path,
+        legacy_root: Path = Path("/app/PCLA-wrapper/PCLA"),
+        image_root: Path = Path("/app/PCLA"),
+    ) -> Path:
+        configured_root = configured_root.resolve()
+        legacy_root = legacy_root.resolve()
+        image_root = image_root.resolve()
+        if configured_root == legacy_root and not configured_root.exists() and image_root.is_dir():
+            logger.warning(
+                "Configured pcla_root %s uses the retired image path; using %s",
+                configured_root,
+                image_root,
+            )
+            return image_root
+        return configured_root
 
     def _config_float(self, name: str, default: float) -> float:
         raw = self.config.get(name, default)

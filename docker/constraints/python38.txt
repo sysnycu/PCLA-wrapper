@@ -1,0 +1,6 @@
+importlib-metadata==7.0.1
+importlib-resources==6.1.1
+packaging==24.2
+setuptools==75.3.0
+typing-extensions==4.13.2
+wheel==0.45.1

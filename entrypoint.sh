@@ -14,4 +14,8 @@ if [[ "${PCLA_PRETRAINED_ROOT}" != "/opt/pcla-pretrained" ]]; then
     exit 1
 fi
 
-exec /opt/conda/envs/PCLA/bin/python -m pcla_wrapper.server
+if (( $# > 0 )); then
+    exec "$@"
+fi
+
+exec /opt/pcla-venv/bin/python -m pcla_wrapper.server

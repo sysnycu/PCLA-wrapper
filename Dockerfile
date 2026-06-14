@@ -1,7 +1,7 @@
-FROM sys511613/pcla@sha256:698fb44c2b9b3a142304f37761a8c1c05dd7cf0a2983736657980c577e72326d AS pcla-runtime
+# syntax=docker/dockerfile:1.7
 FROM docker.io/tonychi/carla:0.9.16 AS carla-runtime
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS common-runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN groupmod --new-name carla ubuntu \
@@ -23,83 +23,66 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     mesa-vulkan-drivers \
+    unzip \
     wget \
     xdg-user-dirs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the legacy runtime after Noble's development package has pulled in
-# libtiff5's transitive image codec dependencies.
+# CARLA 0.9.16 still links against libtiff.so.5. Install the legacy runtime
+# after Noble's development package has pulled in the codec dependencies.
 ADD https://security.ubuntu.com/ubuntu/pool/main/t/tiff/libtiff5_4.3.0-6_amd64.deb /tmp/libtiff5.deb
 RUN dpkg -i /tmp/libtiff5.deb && rm /tmp/libtiff5.deb
 
 COPY --from=carla-runtime --chown=carla:carla /opt/carla /opt/carla
-COPY --from=pcla-runtime /opt/conda /opt/conda
-COPY --from=pcla-runtime /usr/local/cuda-11.8 /usr/local/cuda-11.8
-RUN ln -sfn /usr/local/cuda-11.8 /usr/local/cuda \
-    && ln -sfn /usr/local/cuda-11.8 /usr/local/cuda-11
-
 COPY --from=ghcr.io/astral-sh/uv:0.10.4 /uv /uvx /bin/
 COPY docker/nvidia_icd.json /etc/vulkan/icd.d/nvidia_icd.json
 
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+ENV UV_PYTHON_CACHE_DIR=/tmp/uv-python-cache
+RUN uv python install 3.8.18 \
+    && uv venv --python 3.8.18 /opt/pcla-venv
+
 WORKDIR /app
-COPY pyproject.toml uv.lock README.md ./
-ENV UV_PROJECT_ENVIRONMENT=/opt/conda/envs/PCLA
-RUN uv sync --locked --no-dev --inexact
+COPY docker/requirements /tmp/requirements
+COPY docker/constraints /tmp/constraints
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/pcla-venv/bin/python \
+        --index-url https://download.pytorch.org/whl/cu121 \
+        "torch==2.2.0+cu121" \
+        "torchvision==0.17.0+cu121" \
+        "torchaudio==2.2.0+cu121" \
+    && uv pip install --python /opt/pcla-venv/bin/python \
+        --constraint /tmp/constraints/python38.txt \
+        --requirement /tmp/requirements/core.txt \
+    && uv pip install --python /opt/pcla-venv/bin/python \
+        --constraint /tmp/constraints/python38.txt \
+        --requirement /tmp/requirements/common.txt \
+    && uv pip check --python /opt/pcla-venv/bin/python \
+    && rm -rf /tmp/requirements /tmp/constraints /tmp/uv-python-cache
 
 COPY PCLA/dist/carla-0.9.16-cp38-cp38-linux_x86_64.whl /tmp/
-RUN uv pip install --python /opt/conda/envs/PCLA/bin/python \
-    /tmp/carla-0.9.16-cp38-cp38-linux_x86_64.whl \
+RUN uv pip install --python /opt/pcla-venv/bin/python \
+        /tmp/carla-0.9.16-cp38-cp38-linux_x86_64.whl \
     && rm /tmp/carla-0.9.16-cp38-cp38-linux_x86_64.whl
 
 COPY . /app
+
+# The common runtime supports PlanT 1.0, PlanT 2.0, CaRL, and Roach. Keep one
+# dynamic-map cache and expose only the three weight directories they require.
 RUN set -eux; \
-    canonical_maps=/app/PCLA/pcla_agents/plant2/carla_garage/birds_eye_view; \
-    for agent in simlingo transfuserv5; do \
-        agent_maps="/app/PCLA/pcla_agents/${agent}/birds_eye_view"; \
-        for map_cache in maps_2ppm_cv maps_4ppm_cv maps_8ppm_cv maps_high_res; do \
-            ln -s "${canonical_maps}/${map_cache}" "${agent_maps}/${map_cache}"; \
-        done; \
-    done; \
-    ln -s "${canonical_maps}/maps_2ppm_cv" \
+    ln -s \
+        /app/PCLA/pcla_agents/plant2/carla_garage/birds_eye_view/maps_2ppm_cv \
         /app/PCLA/pcla_agents/carl/birds_eye_view/maps_2ppm_cv; \
-    ln -s "${canonical_maps}/maps_2ppm_cv" \
-        /app/PCLA/pcla_agents/transfuserv6/lead/expert/hdmap/maps_2ppm_cv; \
     canonical_speed_limits=/app/PCLA/pcla_agents/plant/carla_garage/speed_limits; \
-    for agent_speed_limits in \
-        /app/PCLA/pcla_agents/plant2/carla_garage/speed_limits \
-        /app/PCLA/pcla_agents/simlingo/speed_limits \
-        /app/PCLA/pcla_agents/transfuserv5/speed_limits; \
-    do \
-        for speed_limit in "${canonical_speed_limits}"/*_speed_limits.npy; do \
-            ln -s "${speed_limit}" "${agent_speed_limits}/$(basename "${speed_limit}")"; \
-        done; \
-    done
-RUN set -eux; \
-    for name in \
-        carl_pretrained \
-        interfuser_pretrained \
-        lav_pretrained \
-        lmdrive_pretrained \
-        neat_pretrained \
-        plant2_pretrained \
-        plant_pretrained \
-        simlingo_pretrained \
-        transfuserv3_pretrained \
-        transfuserv4_pretrained \
-        transfuserv5_pretrained \
-        transfuserv6_pretrained \
-        wor_pretrained; \
-    do \
+    for speed_limit in "${canonical_speed_limits}"/*_speed_limits.npy; do \
+        ln -s "${speed_limit}" \
+            "/app/PCLA/pcla_agents/plant2/carla_garage/speed_limits/$(basename "${speed_limit}")"; \
+    done; \
+    for name in carl_pretrained plant2_pretrained plant_pretrained; do \
         ln -s "/opt/pcla-pretrained/${name}" \
             "/app/PCLA/pcla_agents/${name}"; \
     done
-RUN uv pip install --python /opt/conda/envs/PCLA/bin/python \
-        --find-links https://data.pyg.org/whl/torch-2.2.0+cu121.html \
-        "torch-scatter==2.1.2" \
-        "ftfy==6.1.1" \
-    && uv pip install --python /opt/conda/envs/PCLA/bin/python --no-deps \
-        --editable /app/PCLA/pcla_agents/lmdrive/vision_encoder \
-        --editable /app/PCLA/pcla_agents/lmdrive/LAVIS
+
 RUN test -f /app/PCLA/PCLA.py \
     && grep -q 'map_name == "OpenDriveMap"' \
         /app/PCLA/pcla_agents/plant2/carla_garage/privileged_route_planner.py \
@@ -109,12 +92,17 @@ RUN test -f /app/PCLA/PCLA.py \
         /app/entrypoint.sh \
         /app/carla_server.sh \
         /app/scripts/download_pcla_pretrained.sh \
-        /app/scripts/validate_pcla_pretrained.py
+        /app/scripts/prepare_weight_profile.py \
+        /app/scripts/smoke_common_agent.py \
+        /app/scripts/validate_common_runtime.py \
+        /app/scripts/validate_pcla_pretrained.py \
+    && PYTHONPATH=/app:/app/PCLA \
+        /opt/pcla-venv/bin/python /app/scripts/validate_common_runtime.py
 
-ENV PATH=/opt/conda/envs/PCLA/bin:/opt/conda/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
-ENV CUDA_VERSION=11.8.0
-ENV NVIDIA_REQUIRE_CUDA="cuda>=11.8"
+ENV PATH=/opt/pcla-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PYTHONPATH=/app:/app/PCLA
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+ENV NVIDIA_REQUIRE_CUDA="cuda>=12.1"
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
@@ -123,9 +111,13 @@ ENV CARLA_HOST=localhost
 ENV CARLA_PORT=2000
 ENV CARLA_TIMEOUT=120
 ENV CARLA_TM_PORT=8000
+ENV CARLA_NULLRHI=1
 ENV CARLA_HOME=/mnt/output/.carla-home
 ENV HOME=/mnt/output/.carla-home
+ENV PCLA_IMAGE_PROFILE=common
 ENV PCLA_PRETRAINED_ROOT=/opt/pcla-pretrained
 ENV CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
+FROM common-runtime AS common-slim

@@ -14,5 +14,4 @@ service.
 - [Troubleshooting](troubleshooting.md): common startup, map, route, sensor, and
   model failures.
 
-For a runnable baseline, start with
-[`config_example.yaml`](../config_example.yaml).
+The configuration reference contains a runnable flat-key baseline.

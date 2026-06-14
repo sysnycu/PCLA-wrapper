@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import inspect
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -19,6 +20,7 @@ from pisa_api.av import (
 
 from pcla_wrapper.lifecycle import clear_dynamic_actors
 from pcla_wrapper.pcla_av import PclaAV
+from pcla_wrapper.profiles import validate_image_profile
 
 
 class FakeLocation:
@@ -335,6 +337,34 @@ def test_pretrained_weights_are_external_and_reproducible():
     assert "curl -fL --retry 5" in downloader
     assert "sha256sum --check -" in downloader
     assert "scripts/validate_pcla_pretrained.py" in downloader
+    assert "sys511613/pcla" not in dockerfile
+    assert "/opt/conda" not in dockerfile
+    assert "/usr/local/cuda-11.8" not in dockerfile
+    assert "FROM common-runtime AS common-slim" in dockerfile
+    assert "PCLA_IMAGE_PROFILE=common" in dockerfile
+    assert "ENV CARLA_NULLRHI=1" in dockerfile
+
+
+def test_common_bundled_image_validates_staged_weights():
+    dockerfile = Path("docker/Dockerfile.bundled").read_text(encoding="utf-8")
+    profiles = json.loads(Path("pcla_wrapper/agent_profiles.json").read_text(encoding="utf-8"))
+
+    assert "ARG BASE_IMAGE=pcla-wrapper:common-slim" in dockerfile
+    assert "COPY . /opt/pcla-pretrained" in dockerfile
+    assert "--check-weights" in dockerfile
+    assert profiles["common"]["weight_directories"] == [
+        "plant_pretrained",
+        "plant2_pretrained",
+        "carl_pretrained",
+    ]
+    assert "simlingo_simlingo" not in profiles["common"]["agents"]
+
+
+def test_entrypoint_allows_runtime_validation_commands():
+    entrypoint = Path("entrypoint.sh").read_text(encoding="utf-8")
+
+    assert 'if (( $# > 0 )); then\n    exec "$@"\nfi' in entrypoint
+    assert "exec /opt/pcla-venv/bin/python -m pcla_wrapper.server" in entrypoint
 
 
 def test_repository_uses_unambiguous_wrapper_and_upstream_paths():
@@ -377,8 +407,28 @@ def test_duplicate_map_assets_are_deduplicated_in_the_image():
     for path in duplicate_speed_limit_paths:
         assert path in dockerignore
 
-    assert "canonical_maps=/app/PCLA/pcla_agents/plant2/" in dockerfile
+    assert "/app/PCLA/pcla_agents/plant2/carla_garage/birds_eye_view/maps_2ppm_cv" in dockerfile
     assert "canonical_speed_limits=/app/PCLA/pcla_agents/plant/" in dockerfile
+
+
+def test_common_profile_accepts_supported_agent_and_rejects_other_profiles(monkeypatch, tmp_path):
+    pretrained_root = tmp_path / "weights"
+    checkpoint = pretrained_root / "plant_pretrained" / "last-v3.ckpt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setenv("PCLA_IMAGE_PROFILE", "common")
+
+    validate_image_profile("carl_plant_3", pretrained_root)
+
+    with pytest.raises(InvalidAvRequest, match="not supported by image profile"):
+        validate_image_profile("simlingo_simlingo", pretrained_root)
+
+
+def test_common_profile_reports_missing_selected_agent_weights(monkeypatch, tmp_path):
+    monkeypatch.setenv("PCLA_IMAGE_PROFILE", "common")
+
+    with pytest.raises(InvalidAvRequest, match="weights are unavailable"):
+        validate_image_profile("plant2_plant2_0", tmp_path)
 
 
 def test_plant_route_planner_uses_world_coordinates():
@@ -526,6 +576,20 @@ def test_config_validation_for_agent_identity_sign_and_timeout(tmp_path):
     adapter._parse_config()
     with pytest.raises(InvalidAvRequest, match="Accepted formats"):
         adapter._validate_agent_name()
+
+
+def test_legacy_image_pcla_root_migrates_to_current_path(tmp_path, caplog):
+    current_root = tmp_path / "PCLA"
+    write_agents(current_root)
+    legacy_root = tmp_path / "PCLA-wrapper" / "PCLA"
+    resolved_root = PclaAV._resolve_pcla_root(
+        legacy_root,
+        legacy_root=legacy_root,
+        image_root=current_root,
+    )
+
+    assert resolved_root == current_root
+    assert "retired image path" in caplog.text
 
 
 def test_init_parses_request_without_loading_models(tmp_path):

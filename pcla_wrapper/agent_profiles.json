@@ -1,0 +1,67 @@
+{
+  "common": {
+    "agents": {
+      "plant2_plant2_0": [
+        "plant2_pretrained/epoch=029_final_0.ckpt"
+      ],
+      "plant2_plant2_1": [
+        "plant2_pretrained/epoch=029_final_1.ckpt"
+      ],
+      "plant2_plant2_2": [
+        "plant2_pretrained/epoch=029_final_2.ckpt"
+      ],
+      "carl_plant_0": [
+        "plant_pretrained/last-v3.ckpt"
+      ],
+      "carl_plant_1": [
+        "plant_pretrained/last-v3.ckpt"
+      ],
+      "carl_plant_2": [
+        "plant_pretrained/last-v3.ckpt"
+      ],
+      "carl_plant_3": [
+        "plant_pretrained/last-v3.ckpt"
+      ],
+      "carl_plant_4": [
+        "plant_pretrained/last-v3.ckpt"
+      ],
+      "carl_carl_0": [
+        "carl_pretrained/CaRL_PY_0_0/config.json",
+        "carl_pretrained/CaRL_PY_0_0/model_final.pth"
+      ],
+      "carl_carl_1": [
+        "carl_pretrained/CaRL_PY_0_1/config.json",
+        "carl_pretrained/CaRL_PY_0_1/model_final.pth"
+      ],
+      "carl_carlv11": [
+        "carl_pretrained/CaRL_v1_1_PY_01/config.json",
+        "carl_pretrained/CaRL_v1_1_PY_01/model_final.pth"
+      ],
+      "carl_roach_0": [
+        "carl_pretrained/Roach_0_0/config.json",
+        "carl_pretrained/Roach_0_0/model_final.pth"
+      ],
+      "carl_roach_1": [
+        "carl_pretrained/Roach_0_1/config.json",
+        "carl_pretrained/Roach_0_1/model_final.pth"
+      ],
+      "carl_roach_2": [
+        "carl_pretrained/Roach_0_2/config.json",
+        "carl_pretrained/Roach_0_2/model_final.pth"
+      ],
+      "carl_roach_3": [
+        "carl_pretrained/Roach_0_3/config.json",
+        "carl_pretrained/Roach_0_3/model_final.pth"
+      ],
+      "carl_roach_4": [
+        "carl_pretrained/Roach_0_4/config.json",
+        "carl_pretrained/Roach_0_4/model_final.pth"
+      ]
+    },
+    "weight_directories": [
+      "plant_pretrained",
+      "plant2_pretrained",
+      "carl_pretrained"
+    ]
+  }
+}
