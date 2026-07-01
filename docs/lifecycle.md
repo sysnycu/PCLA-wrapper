@@ -36,7 +36,8 @@ Any partial failure triggers cleanup before the exception is returned.
 
 ## Step
 
-Step requires a non-empty observation with ego first. It:
+Step reads ego from `observation.ego` and non-ego actors from
+`observation.agents`. Agent list order is presentation-only. It:
 
 1. Synchronizes ego and non-ego shadow actors.
 2. Ticks or waits for CARLA exactly once.

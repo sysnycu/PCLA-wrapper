@@ -86,13 +86,10 @@ read-only path.
 | `ego_role_name` | `hero` | Ego blueprint role name. |
 | `ego_bp_id` | `vehicle.tesla.model3` | Preferred ego blueprint. |
 | `spawn_z_offset` | `3.0` | Ego spawn height offset in meters. |
-| `object_identity_mode` | `stateless` | Non-ego identity strategy. |
-
-Identity modes:
-
-- `stateless`: rebuild non-ego actors every frame.
-- `index`: preserve actors by observation order.
-- `provided`: use `id`, `object_id`, `track_id`, `external_id`, or `name`.
+Agent presentation order never carries identity. When every observed agent has a
+`tracking_id`, the wrapper retains its shadow actor by that ID. If any agent lacks a
+tracking ID, all non-ego actors use stateless destroy/recreate behavior for that frame.
+`entity_name` is optional privileged metadata and is not used as actor identity.
 
 Observation-controlled non-ego actors have physics and gravity disabled. Ego
 physics remains enabled.

@@ -25,10 +25,12 @@ from pisa_api.av import (
     InitRequest,
     InvalidAvRequest,
     ObjectStateData,
+    ObservationData,
     ResetRequest,
     ResetResponse,
     RoadObjectType,
     ScenarioPackData,
+    ShapeType,
     ShouldQuitResponse,
     StepRequest,
     StepResponse,
@@ -40,8 +42,6 @@ from .profiles import validate_image_profile
 logger = logging.getLogger(__name__)
 PCLA_CWD_LOCK = RLock()
 
-OBJECT_IDENTITY_ATTRS = ("id", "object_id", "track_id", "external_id", "name")
-OBJECT_IDENTITY_MODES = {"index", "provided", "stateless"}
 BLUEPRINT_CANDIDATES = {
     RoadObjectType.PEDESTRIAN: ("walker.pedestrian.0001", "walker.pedestrian.*", "walker.*"),
     RoadObjectType.BUS: ("vehicle.mitsubishi.fusorosa", "vehicle.*bus*", "vehicle.*"),
@@ -78,6 +78,8 @@ class PclaAV:
         self._vehicle = None
         self._other_actors_by_key: dict[Any, Any] = {}
         self._other_actor_types_by_key: dict[Any, RoadObjectType] = {}
+        self._stateless_other_actors: list[Any] = []
+        self._using_tracking_ids = False
         self._spawned_actor_ids: set[int] = set()
         self._loaded_map_name = None
         self._loaded_opendrive_path = None
@@ -164,8 +166,6 @@ class PclaAV:
 
     def step(self, request: StepRequest) -> StepResponse:
         with self._lock:
-            if not request.observation:
-                raise InvalidAvRequest("Step observation must include ego state")
             if self._pcla is None or self._vehicle is None:
                 raise AvPreconditionFailed("PCLA scenario is not ready; call reset first")
             self._raise_if_owned_server_exited()
@@ -194,7 +194,7 @@ class PclaAV:
                 self._quit_flag = True
                 self._quit_msg = "PCLA agent reached the route endpoint."
             self._step_count += 1
-            self._log_driving_state(request.observation[0].kinematic, action)
+            self._log_driving_state(request.observation.ego.kinematic, action)
             return StepResponse(
                 ctrl_cmd=ControlCommand(
                     mode=ControlMode.THROTTLE_STEER_BREAK,
@@ -381,14 +381,6 @@ class PclaAV:
         self._yaw_sign = self._config_sign("yaw_sign", -1.0)
         self._steer_sign = self._config_sign("steer_sign", -1.0)
         self._yaw_offset_deg = self._config_float("yaw_offset_deg", 0.0)
-        self._object_identity_mode = str(
-            self.config.get("object_identity_mode", "stateless")
-        ).lower()
-        if self._object_identity_mode not in OBJECT_IDENTITY_MODES:
-            raise InvalidAvRequest(
-                f"Unsupported object_identity_mode: {self._object_identity_mode!r}. "
-                f"Expected one of: {', '.join(sorted(OBJECT_IDENTITY_MODES))}"
-            )
         self._action_none_timeout = self._config_float("action_none_timeout_seconds", 0.0)
         if self._action_none_timeout < 0:
             raise InvalidAvRequest("action_none_timeout_seconds must be non-negative")
@@ -625,15 +617,13 @@ class PclaAV:
     def _validate_reset_request(
         self,
         scenario: ScenarioPackData | None,
-        observation: list[ObjectStateData],
+        observation: ObservationData,
     ) -> None:
         if scenario is None:
             raise InvalidAvRequest("ScenarioPack is required")
         if not getattr(scenario, "map_name", ""):
             raise InvalidAvRequest("ScenarioPack map_name is required")
-        if not observation:
-            raise InvalidAvRequest("Initial observation must include ego state")
-        self._extract_xyz(observation[0].kinematic)
+        self._extract_xyz(observation.ego.kinematic)
         if self._get_goal_position(scenario) is None:
             raise InvalidAvRequest("ScenarioPack ego goal position is required")
 
@@ -743,7 +733,7 @@ class PclaAV:
 
     def _spawn_ego(
         self,
-        observation: list[ObjectStateData],
+        observation: ObservationData,
         scenario: ScenarioPackData,
     ):
         blueprint = self._find_blueprint(
@@ -766,18 +756,15 @@ class PclaAV:
         if ego is None:
             raise AvPreconditionFailed("Failed to spawn ego vehicle")
         self._spawned_actor_ids.add(ego.id)
+        self._apply_state(ego, observation.ego)
         return ego
 
     def _get_spawn_position(
         self,
-        observation: list[ObjectStateData],
+        observation: ObservationData,
         scenario: ScenarioPackData,
     ):
-        if observation:
-            return observation[0].kinematic
-        ego = getattr(scenario, "ego", None)
-        spawn = getattr(ego, "spawn_config", None)
-        return getattr(spawn, "position", None)
+        return observation.ego.kinematic
 
     @staticmethod
     def _get_goal_position(scenario: ScenarioPackData):
@@ -788,7 +775,7 @@ class PclaAV:
     def _resolve_route_path(
         self,
         scenario: ScenarioPackData,
-        observation: list[ObjectStateData],
+        observation: ObservationData,
     ) -> Path:
         raw_start = self._get_spawn_position(observation, scenario)
         raw_goal = self._get_goal_position(scenario)
@@ -983,31 +970,9 @@ class PclaAV:
                 return None
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
-    def _provided_object_identity(self, obj: ObjectStateData):
-        for attr in OBJECT_IDENTITY_ATTRS:
-            value = getattr(obj, attr, None)
-            if value not in (None, ""):
-                return attr, value
-        return None
-
-    def _object_identity(self, obj: ObjectStateData, index: int):
-        if self._object_identity_mode == "index":
-            return "index", index
-        if self._object_identity_mode == "stateless":
-            return "frame", index
-        identity = self._provided_object_identity(obj)
-        if identity is None:
-            raise InvalidAvRequest(
-                "object_identity_mode='provided' requires one of: "
-                + ", ".join(OBJECT_IDENTITY_ATTRS)
-            )
-        return identity
-
     @staticmethod
-    def _role_name_for_object_key(key: Any) -> str:
-        raw = "_".join(str(part) for part in key)
-        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw)
-        return f"agent_{safe}"[:255]
+    def _role_name_for_tracking_id(tracking_id: int) -> str:
+        return f"agent_{tracking_id}"[:255]
 
     def _spawn_actor_allowing_observation_overlap(self, blueprint: Any, transform: Any):
         actor = self._world.try_spawn_actor(blueprint, transform)
@@ -1030,14 +995,107 @@ class PclaAV:
         with contextlib.suppress(Exception):
             actor.set_enable_gravity(False)
 
-    def _apply_kinematic(self, actor: Any, kin: Any, *, kinematic: bool = False) -> None:
+    @staticmethod
+    def _rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float):
+        roll, pitch, yaw = map(math.radians, (roll_deg, pitch_deg, yaw_deg))
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        return (
+            (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+            (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+            (-sp, cp * sr, cp * cr),
+        )
+
+    @staticmethod
+    def _matrix_multiply(left, right):
+        return tuple(
+            tuple(sum(left[row][k] * right[k][column] for k in range(3)) for column in range(3))
+            for row in range(3)
+        )
+
+    @staticmethod
+    def _matrix_vector(matrix, vector):
+        return tuple(sum(matrix[row][k] * vector[k] for k in range(3)) for row in range(3))
+
+    @staticmethod
+    def _matrix_transpose(matrix):
+        return tuple(tuple(matrix[column][row] for column in range(3)) for row in range(3))
+
+    @staticmethod
+    def _matrix_to_rotation(matrix):
+        pitch = math.asin(max(-1.0, min(1.0, -matrix[2][0])))
+        if abs(math.cos(pitch)) > 1e-8:
+            roll = math.atan2(matrix[2][1], matrix[2][2])
+            yaw = math.atan2(matrix[1][0], matrix[0][0])
+        else:
+            roll = 0.0
+            yaw = math.atan2(-matrix[0][1], matrix[1][1])
+        return tuple(map(math.degrees, (roll, pitch, yaw)))
+
+    def _object_transform(self, state: ObjectStateData, actor: Any = None, z_offset: float = 0.0):
+        kin = state.kinematic
+        kin_loc = self._to_carla_location(kin)
+        kin_loc.z += z_offset
+        kin_yaw = self._to_carla_yaw(float(kin.yaw))
+        fallback = self._carla.Transform(
+            kin_loc, self._carla.Rotation(pitch=0.0, yaw=kin_yaw, roll=0.0)
+        )
+        shape = getattr(state, "shape", None)
+        bounding_box = getattr(actor, "bounding_box", None)
+        if shape is None or shape.type != ShapeType.BOUNDING_BOX or bounding_box is None:
+            return fallback
+
+        center = shape.center
+        kin_rotation = self._rotation_matrix(0.0, 0.0, kin_yaw)
+        center_rotation = self._rotation_matrix(
+            math.degrees(float(center.roll)),
+            math.degrees(float(center.pitch)),
+            math.degrees(float(center.yaw)) * self._yaw_sign,
+        )
+        box_world_rotation = self._matrix_multiply(kin_rotation, center_rotation)
+        center_offset = (
+            float(center.x),
+            float(center.y) * self._coordinate_y_sign,
+            float(center.z),
+        )
+        rotated_center = self._matrix_vector(kin_rotation, center_offset)
+        box_world_location = tuple(
+            value + offset
+            for value, offset in zip(
+                (float(kin_loc.x), float(kin_loc.y), float(kin_loc.z)), rotated_center
+            )
+        )
+        local_location = getattr(bounding_box, "location", None)
+        local_rotation = getattr(bounding_box, "rotation", None)
+        actor_box_rotation = self._rotation_matrix(
+            float(getattr(local_rotation, "roll", 0.0)),
+            float(getattr(local_rotation, "pitch", 0.0)),
+            float(getattr(local_rotation, "yaw", 0.0)),
+        )
+        actor_rotation = self._matrix_multiply(
+            box_world_rotation, self._matrix_transpose(actor_box_rotation)
+        )
+        local_offset = (
+            float(getattr(local_location, "x", 0.0)),
+            float(getattr(local_location, "y", 0.0)),
+            float(getattr(local_location, "z", 0.0)),
+        )
+        actor_box_offset = self._matrix_vector(actor_rotation, local_offset)
+        actor_location = self._carla.Location(
+            *(box_world_location[i] - actor_box_offset[i] for i in range(3))
+        )
+        roll, pitch, yaw = self._matrix_to_rotation(actor_rotation)
+        return self._carla.Transform(
+            actor_location, self._carla.Rotation(pitch=pitch, yaw=yaw, roll=roll)
+        )
+
+    def _apply_state(self, actor: Any, state: ObjectStateData, *, kinematic: bool = False) -> None:
         if kinematic:
             self._make_observation_actor_kinematic(actor)
-        location = self._to_carla_location(kin)
+        actor.set_transform(self._object_transform(state, actor))
+        kin = state.kinematic
         yaw = self._to_carla_yaw(float(kin.yaw))
-        actor.set_transform(
-            self._carla.Transform(location, self._carla.Rotation(pitch=0.0, yaw=yaw, roll=0.0))
-        )
         yaw_rad = math.radians(yaw)
         velocity = self._carla.Vector3D(
             float(kin.speed) * math.cos(yaw_rad),
@@ -1056,25 +1114,20 @@ class PclaAV:
             with contextlib.suppress(Exception):
                 actor.set_angular_velocity(angular)
 
-    def _update_and_tick(self, observation: list[ObjectStateData]):
-        self._apply_kinematic(self._vehicle, observation[0].kinematic)
-        if self._object_identity_mode == "stateless":
-            self._destroy_other_actors()
+    def _update_and_tick(self, observation: ObservationData):
+        self._apply_state(self._vehicle, observation.ego)
+        agents = list(observation.agents)
+        tracking_ids = [agent.tracking_id for agent in agents]
+        use_tracking_ids = bool(agents) and all(
+            tracking_id is not None for tracking_id in tracking_ids
+        )
+        if use_tracking_ids and len(set(tracking_ids)) != len(tracking_ids):
+            raise InvalidAvRequest("Observation contains duplicate agent tracking IDs")
 
-        observed_keys = set()
-        for index, obj in enumerate(observation[1:]):
-            key = self._object_identity(obj, index)
-            observed_keys.add(key)
-            actor = self._other_actors_by_key.get(key)
-            if (
-                actor is None
-                or not getattr(actor, "is_alive", True)
-                or self._other_actor_types_by_key.get(key) != obj.type
-            ):
-                if actor is not None:
-                    actor_id = getattr(actor, "id", None)
-                    if destroy_actor(actor, log=logger):
-                        self._spawned_actor_ids.discard(actor_id)
+        if not use_tracking_ids:
+            self._destroy_other_actors()
+            for observed_agent in agents:
+                obj = observed_agent.state
                 candidates = BLUEPRINT_CANDIDATES.get(
                     obj.type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN]
                 )
@@ -1082,30 +1135,57 @@ class PclaAV:
                 if blueprint is None:
                     raise AvPreconditionFailed(f"No CARLA blueprint for object type {obj.type}")
                 if blueprint.has_attribute("role_name"):
-                    blueprint.set_attribute("role_name", self._role_name_for_object_key(key))
-                location = self._to_carla_location(obj.kinematic)
-                transform = self._carla.Transform(
-                    location,
-                    self._carla.Rotation(
-                        pitch=0.0,
-                        yaw=self._to_carla_yaw(float(obj.kinematic.yaw)),
-                        roll=0.0,
-                    ),
-                )
+                    blueprint.set_attribute("role_name", "agent")
+                transform = self._object_transform(obj, z_offset=self._spawn_z_offset)
                 actor = self._spawn_actor_allowing_observation_overlap(blueprint, transform)
                 if actor is None:
-                    raise AvPreconditionFailed(f"Failed to spawn actor for object {key}")
+                    raise AvPreconditionFailed("Failed to spawn stateless observation actor")
                 self._spawned_actor_ids.add(actor.id)
-                self._other_actors_by_key[key] = actor
-                self._other_actor_types_by_key[key] = obj.type
-            self._apply_kinematic(actor, obj.kinematic, kinematic=True)
+                self._stateless_other_actors.append(actor)
+                self._apply_state(actor, obj, kinematic=True)
+        else:
+            if not self._using_tracking_ids:
+                self._destroy_other_actors()
+            self._using_tracking_ids = True
+            observed_keys = set(tracking_ids)
+            for observed_agent in agents:
+                key = observed_agent.tracking_id
+                obj = observed_agent.state
+                actor = self._other_actors_by_key.get(key)
+                if (
+                    actor is None
+                    or not getattr(actor, "is_alive", True)
+                    or self._other_actor_types_by_key.get(key) != obj.type
+                ):
+                    if actor is not None:
+                        actor_id = getattr(actor, "id", None)
+                        if destroy_actor(actor, log=logger):
+                            self._spawned_actor_ids.discard(actor_id)
+                    candidates = BLUEPRINT_CANDIDATES.get(
+                        obj.type, BLUEPRINT_CANDIDATES[RoadObjectType.UNKNOWN]
+                    )
+                    blueprint = self._find_blueprint(
+                        self._world.get_blueprint_library(), candidates
+                    )
+                    if blueprint is None:
+                        raise AvPreconditionFailed(f"No CARLA blueprint for object type {obj.type}")
+                    if blueprint.has_attribute("role_name"):
+                        blueprint.set_attribute("role_name", self._role_name_for_tracking_id(key))
+                    transform = self._object_transform(obj, z_offset=self._spawn_z_offset)
+                    actor = self._spawn_actor_allowing_observation_overlap(blueprint, transform)
+                    if actor is None:
+                        raise AvPreconditionFailed(f"Failed to spawn actor for tracking ID {key}")
+                    self._spawned_actor_ids.add(actor.id)
+                    self._other_actors_by_key[key] = actor
+                    self._other_actor_types_by_key[key] = obj.type
+                self._apply_state(actor, obj, kinematic=True)
 
-        for key in set(self._other_actors_by_key) - observed_keys:
-            actor = self._other_actors_by_key.pop(key)
-            self._other_actor_types_by_key.pop(key, None)
-            actor_id = getattr(actor, "id", None)
-            if destroy_actor(actor, log=logger, label="stale actor"):
-                self._spawned_actor_ids.discard(actor_id)
+            for key in set(self._other_actors_by_key) - observed_keys:
+                actor = self._other_actors_by_key.pop(key)
+                self._other_actor_types_by_key.pop(key, None)
+                actor_id = getattr(actor, "id", None)
+                if destroy_actor(actor, log=logger, label="stale actor"):
+                    self._spawned_actor_ids.discard(actor_id)
 
         if self._sync:
             self._world.tick()
@@ -1114,18 +1194,23 @@ class PclaAV:
         return self._world.get_snapshot()
 
     def _destroy_other_actors(self) -> None:
-        for actor in list(self._other_actors_by_key.values()):
+        actors = [*self._other_actors_by_key.values(), *self._stateless_other_actors]
+        for actor in actors:
             actor_id = getattr(actor, "id", None)
             if destroy_actor(actor, log=logger):
                 self._spawned_actor_ids.discard(actor_id)
         self._other_actors_by_key.clear()
         self._other_actor_types_by_key.clear()
+        self._stateless_other_actors.clear()
+        self._using_tracking_ids = False
 
     def _cleanup_wrapper_actors(self) -> None:
         if self._world is None:
             self._vehicle = None
             self._other_actors_by_key.clear()
             self._other_actor_types_by_key.clear()
+            self._stateless_other_actors.clear()
+            self._using_tracking_ids = False
             self._spawned_actor_ids.clear()
             return
         force_async_world_for_cleanup(
@@ -1135,7 +1220,11 @@ class PclaAV:
             manage_traffic_manager=self._manage_traffic_manager_sync,
             log=logger,
         )
-        actors = [self._vehicle, *self._other_actors_by_key.values()]
+        actors = [
+            self._vehicle,
+            *self._other_actors_by_key.values(),
+            *self._stateless_other_actors,
+        ]
         destroyed = set()
         for actor in actors:
             actor_id = getattr(actor, "id", None)
@@ -1146,6 +1235,8 @@ class PclaAV:
         self._vehicle = None
         self._other_actors_by_key.clear()
         self._other_actor_types_by_key.clear()
+        self._stateless_other_actors.clear()
+        self._using_tracking_ids = False
         self._spawned_actor_ids.clear()
 
     def _finalize(self) -> None:
